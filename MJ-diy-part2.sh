@@ -29,3 +29,9 @@ git clone https://github.com/sirpdboy/luci-app-kucat-config package/feeds/luci/l
 #添加软件
 git clone https://github.com/zzsj0928/luci-app-pushbot package/feeds/luci/luci-app-pushbot
 git clone https://github.com/UnblockNeteaseMusic/luci-app-unblockneteasemusic package/feeds/luci/luci-app-unblockneteasemusic
+
+#修改初始设置
+[ -e package/lean/default-settings/files/zzz-default-settings ] && sed -i "6a/\s\s\s\sset\ssystem.@system[0].hostname=ironman\n" package/lean/default-settings/files/zzz-default-settings
+[ -e package/lean/default-settings/files/zzz-default-settings ] && sed -i "23a/uci\scommit\sluci\n" package/lean/default-settings/files/zzz-default-settings
+[ -e package/lean/default-settings/files/zzz-default-settings ] && sed -i "23a/uci\sset\sluci.main.mediaurlbase=/luci-static/argon\n" package/lean/default-settings/files/zzz-default-settings
+[ -e package/lean/default-settings/files/zzz-default-settings ] && sed -i "23a/uci\sset\sluci.themes.Argon=/luci-static/argon\n" package/lean/default-settings/files/zzz-default-settings
