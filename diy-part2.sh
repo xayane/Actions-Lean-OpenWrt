@@ -9,4 +9,7 @@
 #============================================================
 
 # Modify default IP
-sed -i 's/192.168.1.1/192.168.1.11/g' package/base-files/files/bin/config_generate
+sed -i 's/192.168.1.1/192.168.123.1/g' package/base-files/files/bin/config_generate
+
+#增加主题
+git clone https://github.com/sirpdboy/luci-app-kucat-config package/feeds/luci/luci-app-kucat-config
