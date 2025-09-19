@@ -9,7 +9,7 @@
 #============================================================
 
 # Modify default IP
-sed -i 's/192.168.1.1/192.168.123.1/g' package/base-files/files/bin/config_generate
+sed -i 's/192.168.1.1/10.0.0.1/g' package/base-files/files/bin/config_generate
 
 #增加主题
 rm -rf package/feeds/luci/luci-theme-argon
@@ -21,6 +21,11 @@ git clone https://github.com/xiaoqingfengATGH/luci-theme-infinityfreedom.git pac
 git clone https://github.com/SAENE/luci-theme-design.git package/feeds/luci/luci-theme-design
 git clone -b master https://github.com/jerrykuku/luci-theme-argon.git package/feeds/luci/luci-theme-argon
 git clone -b master https://github.com/jerrykuku/luci-app-argon-config.git package/feeds/luci/luci-app-argon-config
+git clone https://github.com/derisamedia/luci-theme-alpha package/feeds/luci/luci-theme-alpha
+git clone https://github.com/derisamedia/luci-app-alpha-config package/feeds/luci/luci-app-alpha-config
+git clone -b js https://github.com/sirpdboy/luci-theme-kucat package/feeds/luci/luci-theme-kucat
+git clone https://github.com/sirpdboy/luci-app-kucat-config package/feeds/luci/luci-app-kucat-config
+
+#添加软件
 git clone https://github.com/zzsj0928/luci-app-pushbot package/feeds/luci/luci-app-pushbot
 git clone https://github.com/UnblockNeteaseMusic/luci-app-unblockneteasemusic package/feeds/luci/luci-app-unblockneteasemusic
-git clone https://github.com/sirpdboy/luci-app-kucat-config package/feeds/luci/luci-app-kucat-config
