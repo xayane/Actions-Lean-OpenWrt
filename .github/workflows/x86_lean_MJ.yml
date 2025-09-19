@@ -6,14 +6,14 @@
 # Blog: https://P3TERX.com
 #=================================================
 
-name: Build x64 lean for GXT R2Max
+name: Build x64 lean for MJ R2Max
 
 on:
   repository_dispatch:
   workflow_dispatch:
     inputs:
       force-build:
-        description: "Build x64 lean for GXT R2Max"
+        description: "Build x64 lean for MJ R2Max"
         required: false
         default: "false"
   # Uncomment the following to run regularly. Note that the cron expression here does not contain seconds.
