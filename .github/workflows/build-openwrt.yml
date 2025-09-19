@@ -6,25 +6,59 @@
 # Blog: https://P3TERX.com
 #=================================================
 
-name: OpenWrt Builder
+name: Build x64 lean for GXT R2Max
 
 on:
   repository_dispatch:
   workflow_dispatch:
+    inputs:
+      force-build:
+        description: "Build x64 lean for GXT R2Max"
+        required: false
+        default: "false"
+  # Uncomment the following to run regularly. Note that the cron expression here does not contain seconds.
+  schedule:
+    - cron: '30 1 * * *'
 
 env:
+  REPO_NAME: lean x64 Openwrt
   REPO_URL: https://github.com/coolsnowwolf/lede
   REPO_BRANCH: master
   FEEDS_CONF: feeds.conf.default
-  CONFIG_FILE: x86_64_mini.config
-  DIY_P1_SH: diy-part1.sh
-  DIY_P2_SH: diy-part2.sh
+  CONFIG_FILE: GXT-x86_64_mini.config
+  DIY_P1_SH: GXT-diy-part1.sh
+  DIY_P2_SH: GXT-diy-part2.sh
   UPLOAD_BIN_DIR: false
   UPLOAD_FIRMWARE: true
   UPLOAD_RELEASE: true
   TZ: Asia/Shanghai
 
 jobs:
+  check:
+    name: Check for source code updates
+    runs-on: ubuntu-latest
+    outputs:
+      cache-hit: ${{ steps.cache-hash.outputs.cache-hit }}
+
+    steps:
+      - name: Get Commit Hash
+        id: get-hash
+        run: |
+          git clone --depth 1 --branch $REPO_BRANCH --single-branch $REPO_URL ./
+          echo "commit-hash=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Compare Commit Hash
+        id: cache-hash
+        uses: actions/cache@main
+        with:
+          path: .${{ env.REPO_NAME }}-${{ env.REPO_BRANCH }}-commit-hash
+          key: HEAD-${{ steps.get-hash.outputs.commit-hash }}
+
+      - name: Save New Commit Hash
+        if: steps.cache-hash.outputs.cache-hit != 'true'
+        run: |
+          echo ${{ steps.get-hash.outputs.commit-hash }} | 
+            tee .$REPO_NAME-$REPO_BRANCH-commit-hash
   build:
     runs-on: ubuntu-22.04
 
