@@ -29,12 +29,12 @@ git clone https://github.com/zzsj0928/luci-app-pushbot package/feeds/luci/luci-a
 git clone https://github.com/UnblockNeteaseMusic/luci-app-unblockneteasemusic package/feeds/luci/luci-app-unblockneteasemusic
 
 #修改初始设置
-[ -e package/lean/default-settings/files/zzz-default-settings ] && sed -i "5a\ \tset system.@system[0].hostname=ironman" package/lean/default-settings/files/zzz-default-settings
-[ -e package/lean/default-settings/files/zzz-default-settings ] && sed -i "23a\uci commit luci" package/lean/default-settings/files/zzz-default-settings
-[ -e package/lean/default-settings/files/zzz-default-settings ] && sed -i "23a\uci set luci.main.mediaurlbase=/luci-static/argon" package/lean/default-settings/files/zzz-default-settings
-[ -e package/lean/default-settings/files/zzz-default-settings ] && sed -i "23a\uci set luci.themes.Argon=/luci-static/argon" package/lean/default-settings/files/zzz-default-settings
-[ -e package/lean/default-settings/files/zzz-default-settings ] && sed -i "23a\uci commit network" package/lean/default-settings/files/zzz-default-settings
-[ -e package/lean/default-settings/files/zzz-default-settings ] && sed -i "23a\uci set network.lan.ifname='lan'" package/lean/default-settings/files/zzz-default-settings
-[ -e package/lean/default-settings/files/zzz-default-settings ] && sed -i "23a\uci set network.lan.type='bridge'" package/lean/default-settings/files/zzz-default-settings
-[ -e package/lean/default-settings/files/zzz-default-settings ] && sed -i "23a\uci set network.lan.proto='static'" package/lean/default-settings/files/zzz-default-settings
-[ -e package/lean/default-settings/files/zzz-default-settings ] && sed -i "23a\uci set network.lan.ipaddr='10.0.0.1'" package/lean/default-settings/files/zzz-default-settings
+#[ -e package/lean/default-settings/files/zzz-default-settings ] && sed -i "5a\ \tset system.@system[0].hostname=ironman" package/lean/default-settings/files/zzz-default-settings
+#[ -e package/lean/default-settings/files/zzz-default-settings ] && sed -i "23a\uci commit luci" package/lean/default-settings/files/zzz-default-settings
+#[ -e package/lean/default-settings/files/zzz-default-settings ] && sed -i "23a\uci set luci.main.mediaurlbase=/luci-static/argon" package/lean/default-settings/files/zzz-default-settings
+#[ -e package/lean/default-settings/files/zzz-default-settings ] && sed -i "23a\uci set luci.themes.Argon=/luci-static/argon" package/lean/default-settings/files/zzz-default-settings
+#[ -e package/lean/default-settings/files/zzz-default-settings ] && sed -i "23a\uci commit network" package/lean/default-settings/files/zzz-default-settings
+#[ -e package/lean/default-settings/files/zzz-default-settings ] && sed -i "23a\uci set network.lan.ifname='lan'" package/lean/default-settings/files/zzz-default-settings
+#[ -e package/lean/default-settings/files/zzz-default-settings ] && sed -i "23a\uci set network.lan.type='bridge'" package/lean/default-settings/files/zzz-default-settings
+#[ -e package/lean/default-settings/files/zzz-default-settings ] && sed -i "23a\uci set network.lan.proto='static'" package/lean/default-settings/files/zzz-default-settings
+#[ -e package/lean/default-settings/files/zzz-default-settings ] && sed -i "23a\uci set network.lan.ipaddr='10.0.0.1'" package/lean/default-settings/files/zzz-default-settings
