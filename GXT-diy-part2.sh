@@ -36,9 +36,9 @@ sed -i "s/OpenWrt /KK build $(TZ=UTC-8 date "+%Y.%m.%d") @ OpenWrt /g" package/l
 
 # 修改默认主题
 ## 新版（需要使用JS版本主题，否则会进不去后台，提示"Unhandled exception during request dispatching"）
-## sed -i "s/luci-theme-bootstrap/luci-theme-argon/g" feeds/luci/collections/luci-light/Makefile
+sed -i "s/luci-theme-bootstrap/luci-theme-argon/g" feeds/luci/collections/luci-light/Makefile
 ## 旧版
-## sed -i "s/luci-theme-bootstrap/luci-theme-argon/g" feeds/luci/collections/luci/Makefile
+sed -i "s/luci-theme-bootstrap/luci-theme-argon/g" feeds/luci/collections/luci/Makefile
 
 # ============================================
 # 替换 zerotier 为 immortalwrt 版本
