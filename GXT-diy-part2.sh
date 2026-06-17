@@ -36,6 +36,20 @@ sed -i "s/OpenWrt /KK build $(TZ=UTC-8 date "+%Y.%m.%d") @ OpenWrt /g" package/l
 
 # 修改默认主题
 ## 新版（需要使用JS版本主题，否则会进不去后台，提示"Unhandled exception during request dispatching"）
-sed -i "s/luci-theme-bootstrap/luci-theme-argon/g" feeds/luci/collections/luci-light/Makefile
+## sed -i "s/luci-theme-bootstrap/luci-theme-argon/g" feeds/luci/collections/luci-light/Makefile
 ## 旧版
-sed -i "s/luci-theme-bootstrap/luci-theme-argon/g" feeds/luci/collections/luci/Makefile
+## sed -i "s/luci-theme-bootstrap/luci-theme-argon/g" feeds/luci/collections/luci/Makefile
+
+# ============================================
+# 替换 zerotier 为 immortalwrt 版本
+# ============================================
+# 删除 coolsnowwolf 的 zerotier 包
+rm -rf feeds/packages/net/zerotier
+
+# 从 immortalwrt 拉取 zerotier（git sparse-checkout，只下载 net/zerotier 文件夹）
+git clone --depth 1 --filter=blob:none --sparse https://github.com/immortalwrt/packages.git /tmp/immortalwrt-packages
+cd /tmp/immortalwrt-packages
+git sparse-checkout set net/zerotier
+cd -
+cp -r /tmp/immortalwrt-packages/net/zerotier feeds/packages/net/
+rm -rf /tmp/immortalwrt-packages
