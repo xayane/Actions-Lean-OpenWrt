@@ -40,6 +40,9 @@ sed -i "s/luci-theme-bootstrap/luci-theme-argon/g" feeds/luci/collections/luci-l
 ## 旧版
 sed -i "s/luci-theme-bootstrap/luci-theme-argon/g" feeds/luci/collections/luci/Makefile
 
+# 删除冲突插件
+rm -rf feeds/small/{base-files,dnsmasq,firewall*,fullconenat,libnftnl,nftables,ppp,opkg,ucl,upx,vsftpd*,miniupnpd-iptables,wireless-regdb}
+
 # ============================================
 # 替换 zerotier 为 immortalwrt 版本
 # ============================================
