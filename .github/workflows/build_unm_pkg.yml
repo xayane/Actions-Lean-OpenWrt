@@ -168,22 +168,54 @@ jobs:
       run: |
         cd openwrt
         cp "$GITHUB_WORKSPACE/$CONFIG_FILE" .config
+        # 仓库里的 unm.config 在 Windows 上编辑过会是 CRLF; kconfig 自己能剥掉 \r,
+        # 但这里顺手归一化, 免得后续比较/排查时被行尾差异干扰
+        sed -i 's/\r$//' .config
+        echo "----- 喂给 defconfig 的关键行 -----"
+        grep -E '^CONFIG_(TARGET|PACKAGE_node|PACKAGE_luci-app-unblockneteasemusic)' .config || true
         make defconfig
 
     - name: Verify configuration
       run: |
         cd openwrt
-        fail=0
-        grep -qE '^CONFIG_TARGET_x86_64_Generic=y' .config || { echo "::error::target 配置丢失"; fail=1; }
-        grep -qE "^CONFIG_PACKAGE_${UNM_PKG}=y" .config || { echo "::error::unblockneteasemusic 未选中"; fail=1; }
-        grep -qE '^CONFIG_PACKAGE_node=y' .config || { echo "::error::node 未选中, 产物将缺少运行时"; fail=1; }
-        # v3.4 的 LUCI_DEPENDS 含 @PACKAGE_firewall4, 缺它则包根本不可选
-        grep -qE '^CONFIG_PACKAGE_firewall4=y' .config || { echo "::error::firewall4 未选中(插件依赖 @PACKAGE_firewall4)"; fail=1; }
-        [ $fail -eq 0 ] || exit 1
-        echo "----- 关键配置 -----"
-        grep -E "^CONFIG_(TARGET_x86_64_Generic|PACKAGE_node|PACKAGE_node-npm|PACKAGE_${UNM_PKG}|PACKAGE_dnsmasq-full|PACKAGE_firewall4|PACKAGE_nftables-json|PACKAGE_ucode)=" .config
-        echo "----- node 版本选择 -----"
+        echo "########## .config 行数: $(wc -l < .config)"
+        echo "########## 生效的 target / arch ##########"
+        grep -E '^CONFIG_(TARGET|ARCH|BUILD_)' .config || true
+        echo "########## 关键包 ##########"
+        grep -E "^CONFIG_PACKAGE_(node|${UNM_PKG}|firewall4|nftables-json|ucode|dnsmasq-full)=" .config || true
+        echo "########## node 相关选项 ##########"
         grep -E '^CONFIG_NODEJS' .config || true
+
+        fail=0
+        # node 的 ABI 只由 board + subtarget 决定(它们决定 ARCH、工具链、libc/libstdc++/libssl),
+        # profile 只影响镜像打包与 DEFAULT_PACKAGES, 单包编译不需要它。
+        # 所以硬断言只落在 board/subtarget 上。
+        grep -qE '^CONFIG_TARGET_x86=y' .config \
+          || { echo "::error::board 未选中: CONFIG_TARGET_x86 缺失"; fail=1; }
+        grep -qE '^CONFIG_TARGET_x86_64=y' .config \
+          || { echo "::error::subtarget 未选中: CONFIG_TARGET_x86_64 缺失"; fail=1; }
+
+        # profile 的符号名随源码版本变过:
+        #   旧版 target/linux/x86/64/target.mk 有 `define Profile/Generic` -> CONFIG_TARGET_x86_64_Generic
+        #   新版只剩 image/64.mk 的 `define Device/generic` + TARGET_DEVICES -> CONFIG_TARGET_x86_64_DEVICE_generic
+        # 当前 LEDE master 的 target.mk 里已经没有 Profile/Generic, 所以只断言 Generic 必然失败。
+        # 这里按"三选一命中即可, 但一个 profile 都没有就真错了"来判。
+        if grep -qE '^CONFIG_TARGET_x86_64_(Generic|DEVICE_generic)=y' .config; then
+          echo "OK: x86_64 的 Generic profile 已选中"
+        elif grep -qE '^CONFIG_TARGET_x86_64_[A-Za-z0-9_]+=y' .config; then
+          echo "::warning::profile 符号与预期不同, 实际为:"
+          grep -E '^CONFIG_TARGET_x86_64_[A-Za-z0-9_]+=y' .config | head -5
+        else
+          echo "::error::x86_64 下没有任何 profile 被选中, defconfig 可能把 target 整体丢了"
+          fail=1
+        fi
+
+        for sym in "PACKAGE_${UNM_PKG}" PACKAGE_node PACKAGE_firewall4; do
+          grep -qE "^CONFIG_${sym}=y" .config || { echo "::error::${sym} 未选中"; fail=1; }
+        done
+
+        [ $fail -eq 0 ] || exit 1
+        echo "OK: 配置校验通过(board/subtarget 与关键包均已就位)"
 
     - name: Build tools and toolchain
       run: |
