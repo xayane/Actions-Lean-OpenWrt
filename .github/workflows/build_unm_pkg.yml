@@ -111,7 +111,6 @@ jobs:
             echo "短哈希 ${RAW} -> 完整 ${FULL}"
           fi
 
-          # 优先只取这一个 commit; 服务器不允许按 sha 取时逐级加深
           git fetch --depth 1 origin "$FULL" 2>/dev/null \
             || git fetch --depth 500 origin "$REPO_BRANCH" 2>/dev/null \
             || git fetch origin
@@ -142,8 +141,7 @@ jobs:
           echo "::error::luci feed 中找不到 ${UNM_PKG}, 请检查 feeds.conf.default 的 luci 分支"
           exit 1
         }
-        # feed 版 Makefile 用相对路径 include ../../luci.mk,
-        # 因此必须是 feeds 的符号链接形态; 若被替换成真实目录会报找不到 luci.mk
+
         if [ -L "$PKG_DIR" ]; then
           echo "OK: ${PKG_DIR} 是符号链接(相对 include 可用)"
         else
@@ -168,8 +166,6 @@ jobs:
       run: |
         cd openwrt
         cp "$GITHUB_WORKSPACE/$CONFIG_FILE" .config
-        # 仓库里的 unm.config 在 Windows 上编辑过会是 CRLF; kconfig 自己能剥掉 \r,
-        # 但这里顺手归一化, 免得后续比较/排查时被行尾差异干扰
         sed -i 's/\r$//' .config
         echo "----- 喂给 defconfig 的关键行 -----"
         grep -E '^CONFIG_(TARGET|PACKAGE_node|PACKAGE_luci-app-unblockneteasemusic)' .config || true
@@ -187,19 +183,12 @@ jobs:
         grep -E '^CONFIG_NODEJS' .config || true
 
         fail=0
-        # node 的 ABI 只由 board + subtarget 决定(它们决定 ARCH、工具链、libc/libstdc++/libssl),
-        # profile 只影响镜像打包与 DEFAULT_PACKAGES, 单包编译不需要它。
-        # 所以硬断言只落在 board/subtarget 上。
+
         grep -qE '^CONFIG_TARGET_x86=y' .config \
           || { echo "::error::board 未选中: CONFIG_TARGET_x86 缺失"; fail=1; }
         grep -qE '^CONFIG_TARGET_x86_64=y' .config \
           || { echo "::error::subtarget 未选中: CONFIG_TARGET_x86_64 缺失"; fail=1; }
 
-        # profile 的符号名随源码版本变过:
-        #   旧版 target/linux/x86/64/target.mk 有 `define Profile/Generic` -> CONFIG_TARGET_x86_64_Generic
-        #   新版只剩 image/64.mk 的 `define Device/generic` + TARGET_DEVICES -> CONFIG_TARGET_x86_64_DEVICE_generic
-        # 当前 LEDE master 的 target.mk 里已经没有 Profile/Generic, 所以只断言 Generic 必然失败。
-        # 这里按"三选一命中即可, 但一个 profile 都没有就真错了"来判。
         if grep -qE '^CONFIG_TARGET_x86_64_(Generic|DEVICE_generic)=y' .config; then
           echo "OK: x86_64 的 Generic profile 已选中"
         elif grep -qE '^CONFIG_TARGET_x86_64_[A-Za-z0-9_]+=y' .config; then
@@ -217,6 +206,55 @@ jobs:
         [ $fail -eq 0 ] || exit 1
         echo "OK: 配置校验通过(board/subtarget 与关键包均已就位)"
 
+
+    - name: Resolve package build targets
+      run: |
+        cd openwrt
+
+        make -q -p > /tmp/make-db.txt 2>/dev/null || true
+        sed -n 's/^\(package\/[^:[:space:]]*\/compile\):.*/\1/p' /tmp/make-db.txt \
+          | sort -u > /tmp/pkg-targets.txt
+        echo "规则库(.make DB)大小: $(du -h /tmp/make-db.txt | cut -f1)"
+        TOTAL=$(wc -l < /tmp/pkg-targets.txt)
+        echo "规则库里已注册的 package 编译目标: ${TOTAL} 个"
+
+        if [ "$TOTAL" -eq 0 ]; then
+          echo "::warning::make -p 没抓到任何 package 编译目标, 规则库可能没解析出来, 改用目录别名兜底"
+          echo "NODE_GOAL=package/node/compile" >> $GITHUB_ENV
+          echo "UNM_GOAL=package/${UNM_PKG}/compile" >> $GITHUB_ENV
+          exit 0
+        fi
+
+        resolve_goal() {
+          local name="$1" src cand
+          src="$(awk -v want="$1" '
+            /^Source-Makefile: / { p = $2; sub(/\/Makefile$/, "", p) }
+            /^Package: / && $2 == want { print p; exit }
+          ' tmp/.packageinfo)"
+          echo "  ${name}: 源码目录 = ${src:-<未在 tmp/.packageinfo 中找到>}" >&2
+          for cand in "package/${src}/compile" "package/${name}/compile"; do
+            [ "$cand" = "package//compile" ] && continue
+            if grep -qxF "$cand" /tmp/pkg-targets.txt; then echo "$cand"; return 0; fi
+          done
+          return 1
+        }
+
+        if ! NODE_GOAL="$(resolve_goal node)"; then
+          echo "::error::node 的编译目标没有注册, 继续跑会落进 %:: 兜底规则并去编内核模块"
+          grep -E '/node/compile$' /tmp/pkg-targets.txt | head -20 || true
+          exit 1
+        fi
+        if ! UNM_GOAL="$(resolve_goal "$UNM_PKG")"; then
+          echo "::error::${UNM_PKG} 的编译目标没有注册"
+          grep -F "$UNM_PKG" /tmp/pkg-targets.txt | head -20 || true
+          exit 1
+        fi
+
+        echo "NODE_GOAL=$NODE_GOAL" >> $GITHUB_ENV
+        echo "UNM_GOAL=$UNM_GOAL" >> $GITHUB_ENV
+        echo "node -> $NODE_GOAL"
+        echo "unm  -> $UNM_GOAL"
+
     - name: Build tools and toolchain
       run: |
         cd openwrt
@@ -226,14 +264,14 @@ jobs:
     - name: Compile node runtime
       run: |
         cd openwrt
-        make package/feeds/packages/node/compile V=s -j$(nproc) \
-          || make package/feeds/packages/node/compile V=s -j1
+        echo "目标: $NODE_GOAL"
+        make "$NODE_GOAL" V=s -j$(nproc) || make "$NODE_GOAL" V=s -j1
 
     - name: Compile luci-app-unblockneteasemusic
       run: |
         cd openwrt
-        make package/feeds/luci/luci-app-unblockneteasemusic/compile V=s -j$(nproc) \
-          || make package/feeds/luci/luci-app-unblockneteasemusic/compile V=s -j1
+        echo "目标: $UNM_GOAL"
+        make "$UNM_GOAL" V=s -j$(nproc) || make "$UNM_GOAL" V=s -j1
 
     - name: Collect ipk and inspect control data
       run: |
