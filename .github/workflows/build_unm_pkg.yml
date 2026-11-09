@@ -28,13 +28,54 @@ env:
   UNM_PKG: luci-app-unblockneteasemusic
   TZ: Asia/Shanghai
 
+permissions:
+  contents: read
+
+concurrency:
+  group: unm-ipk-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
-    runs-on: ubuntu-22.04
+
+    runs-on: ubuntu-26.04
 
     steps:
     - name: Checkout
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
+
+    - name: Show runner environment
+      run: |
+        . /etc/os-release
+        echo "########## runner ##########"
+        echo "image       : ${PRETTY_NAME} (VERSION_ID=${VERSION_ID})"
+        echo "kernel      : $(uname -r)"
+        echo "glibc       : $(ldd --version | head -1 | awk '{print $NF}')"
+        echo "cpu         : $(nproc) 核 / $(lscpu | awk -F: '/Model name/{gsub(/^ +| +$/,"",$2); print $2; exit}')"
+        echo "memory      : $(free -h | awk '/^Mem:/{print $2}')"
+        echo "disk (root) : $(df -hT / | awk 'NR==2{print $4" 可用 / 共 "$3}')"
+        echo "python3     : $(python3 -V 2>&1)"
+        echo "gcc         : $(gcc --version | head -1)"
+        echo "########## apt 源 ##########"
+        ls -1 /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null || true
+        # 24.04 起默认源是 deb822 格式(ubuntu.sources 里的 Types: deb),
+        # 老格式是 sources.list / *.list 里的 deb 行, 两种都要认。
+        # 注意只把"确实存在的文件"交给 grep: grep 遇到不存在的文件会返回 2,
+        # 在 `if ! grep` 里会被误判成"没有源"。
+        srcs=""
+        if [ -f /etc/apt/sources.list ]; then srcs="$srcs /etc/apt/sources.list"; fi
+        for f in /etc/apt/sources.list.d/*; do
+          if [ -f "$f" ]; then srcs="$srcs $f"; fi
+        done
+        if [ -z "$srcs" ]; then
+          echo "::error::runner 上不存在任何 apt 源文件, 后续依赖装不上"
+          exit 1
+        fi
+        if ! grep -hsE '^(deb|Types:)' $srcs >/dev/null 2>&1; then
+          echo "::error::apt 源文件里没有有效的 deb / Types: 行, 后续依赖装不上"
+          exit 1
+        fi
+        echo "OK: apt 源存在 ($(echo $srcs | wc -w) 个文件)"
 
     - name: Free Disk Space (Ubuntu)
       uses: jlumbroso/free-disk-space@main
@@ -47,22 +88,100 @@ jobs:
         large-packages: true
         swap-storage: true
 
+
     - name: Install build dependencies
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
-        sudo -E apt update
-        sudo -E apt -y install ack antlr3 asciidoc autoconf automake autopoint binutils bison \
-          build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler flex gawk \
-          gcc-multilib g++-multilib gettext genisoimage git gperf haveged help2man intltool \
-          libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev \
-          libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libpython3-dev \
-          libreadline-dev libssl-dev libtool llvm lrzsz msmtp ninja-build p7zip p7zip-full \
-          patch pkgconf python3 python3-pyelftools python3-setuptools qemu-utils rsync \
-          scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget \
-          xmlto xxd zlib1g-dev
-        sudo timedatectl set-timezone "$TZ"
-        df -hT
+        set -o pipefail
+        . /etc/os-release
+        echo "镜像: ${PRETTY_NAME} (VERSION_ID=${VERSION_ID})"
+
+        sudo -E apt-get update -qq || { echo "::error::apt update 失败, 检查 runner 的 apt 源与网络"; exit 1; }
+
+        has_pkg() { apt-cache show "$1" >/dev/null 2>&1; }
+        pick() {
+          for p in "$@"; do
+            if has_pkg "$p"; then printf '%s' "$p"; return 0; fi
+          done
+          return 1
+        }
+
+        NCURSES="$(pick libncurses-dev libncurses5-dev || true)"
+        NCURSESW="$(pick libncursesw-dev libncursesw5-dev || true)"
+        if [ -n "$NCURSES" ]; then
+          echo "ncurses 头文件包: $NCURSES"
+        else
+          echo "::error::当前镜像找不到 ncurses 开发包(libncurses-dev 与 libncurses5-dev 都不存在)"
+          exit 1
+        fi
+        [ -n "$NCURSESW" ] && echo "ncursesw 头文件包: $NCURSESW (可缺省)"
+
+        # 编 node 与本插件离不开的包。任何一个缺失都直接失败 —— 缺了必然编不过,
+        # 第 30 秒报错远好过第 40 分钟才报。
+        MUST="build-essential gcc-multilib g++-multilib autoconf automake libtool
+              binutils bison flex gawk gettext pkgconf cmake ninja-build patch cpio
+              rsync wget curl git unzip bzip2 xz-utils zlib1g-dev libssl-dev
+              libelf-dev libltdl-dev libmpc-dev libmpfr-dev libgmp3-dev libreadline-dev
+              libpython3-dev python3 python3-setuptools python3-pyelftools texinfo
+              subversion swig squashfs-tools scons device-tree-compiler qemu-utils
+              upx-ucl libglib2.0-dev libfuse-dev"
+
+        # 只在完整固件编译或个别插件里用到, 缺了不影响 node/UNM, 降级为告警。
+        OPT="ack antlr3 asciidoc autopoint ccache clang llvm genisoimage gperf haveged help2man
+             intltool libc6-dev-i386 lrzsz msmtp p7zip p7zip-full uglifyjs vim xmlto xxd"
+
+        must_list=""; must_missing=""
+        for p in $MUST; do
+          if has_pkg "$p"; then must_list="$must_list $p"; else must_missing="$must_missing $p"; fi
+        done
+        must_list="$must_list $NCURSES"
+        [ -n "$NCURSESW" ] && must_list="$must_list $NCURSESW"
+
+        if [ -n "$must_missing" ]; then
+          echo "::error::以下必需依赖在 ${PRETTY_NAME} 中不存在:${must_missing}"
+          echo "::error::说明 runner 换了发行版, 需要更新本步骤 MUST 列表的包名映射"
+          exit 1
+        fi
+
+        echo "安装必需依赖: $(echo $must_list | wc -w) 个"
+        sudo -E apt-get -y install $must_list || { echo "::error::必需依赖安装失败"; exit 1; }
+
+        opt_list=""; opt_missing=""
+        for p in $OPT; do
+          if has_pkg "$p"; then opt_list="$opt_list $p"; else opt_missing="$opt_missing $p"; fi
+        done
+
+        # 先整批装; 失败再逐个重试, 把真正装不上的挑出来, 不让单个包拖垮整步
+        if [ -n "$opt_list" ]; then
+          if ! sudo -E apt-get -y install $opt_list >/dev/null 2>&1; then
+            echo "::warning::可选依赖整批安装失败, 改为逐个安装定位"
+            for p in $opt_list; do
+              sudo -E apt-get -y install "$p" >/dev/null 2>&1 || opt_missing="$opt_missing $p"
+            done
+          fi
+        fi
+        if [ -n "$opt_missing" ]; then
+          echo "::warning::以下可选依赖在本镜像不可用(不影响 node/UNM 编译):${opt_missing}"
+        fi
+
+        # python3.12 起 distutils 从标准库移除, 旧版 LEDE 脚本仍可能 import distutils。
+        # 有独立包就装; 没有就看 setuptools 是否兜住; 两样都没有才告警。
+        if has_pkg python3-distutils; then
+          sudo -E apt-get -y install python3-distutils >/dev/null 2>&1 && echo "已装 python3-distutils"
+        elif python3 -c 'import setuptools' >/dev/null 2>&1; then
+          echo "distutils 由 setuptools 提供(现代源码已不依赖独立的 distutils 包)"
+        else
+          echo "::warning::python3-distutils 不可用且 setuptools 缺失, 旧构建脚本可能报 No module named 'distutils'"
+        fi
+
+        sudo timedatectl set-timezone "$TZ" || echo "::warning::设置时区失败(容器环境常见), 不影响构建"
+
+        echo "########## 关键工具版本 ##########"
+        for c in gcc g++ make python3 perl rsync; do
+          printf '%-8s %s\n' "$c" "$(command -v $c >/dev/null 2>&1 && $c --version 2>&1 | head -1 || echo 缺失)"
+        done
+        df -hT /
 
     - name: Clone LEDE
       env:
@@ -127,6 +246,59 @@ jobs:
         echo "LEDE_COMMIT=$(git rev-parse HEAD)" >> $GITHUB_ENV
         echo "SHORT_COMMIT=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
         git log -1 --format='LEDE commit: %H%n提交日期: %ci%n标题: %s'
+
+    # ── 构建缓存 ────────────────────────────────────────────────────────────
+    # 两段缓存的取舍不同, 分开设计是为了控制"复用旧产物导致结果错误"的风险:
+    #
+    # 1) dl/ —— LEDE 下载的源码包。每个 tarball 都带哈希校验, 复用不影响正确性,
+    #    所以用 restore-keys 前缀命中: 即使换了 commit, 也能吃到已下载的那部分,
+    #    省掉 1-2 GB 的网络下载。
+    # 2) 宿主工具链(host 工具 + 交叉工具链) —— 与 commit 强绑定(gcc/binutils 版本
+    #    由 commit 决定), 因此**只设精确 key、不设 restore-keys**, 绝不复用别的 commit
+    #    的产物。它只在"同一 commit 重跑"时命中, 而这恰好是最需要救的场景:
+    #    上次跑到第 60 分钟失败, 重跑时不必再花 20-40 分钟重编工具链。
+    #    必须 staging_dir 与 build_dir 成对缓存: make 判断"是否已编译"看的是
+    #    build_dir 里的 stamp, 只恢复 staging_dir 的话它照样从头再编一遍, 等于没缓存。
+    #    目标侧(target-*)不缓存: 它与 .config 的包选择耦合, 恢复半套会造出不一致的构建树。
+    #    actions/cache 的保存动作是 post-if: success(), 失败运行不会写入缓存。
+    - name: Restore source package cache (dl)
+      id: dl-cache
+      uses: actions/cache@v6
+      with:
+        path: openwrt/dl
+        key: unm-dl-${{ env.REPO_BRANCH }}-${{ env.LEDE_COMMIT }}
+        restore-keys: |
+          unm-dl-${{ env.REPO_BRANCH }}-
+          unm-dl-
+
+    - name: Restore host toolchain cache (same commit only)
+      id: host-cache
+      uses: actions/cache@v6
+      with:
+        path: |
+          openwrt/staging_dir/host
+          openwrt/staging_dir/toolchain-*
+          openwrt/build_dir/host
+          openwrt/build_dir/toolchain-*
+        key: unm-host-${{ env.LEDE_COMMIT }}-${{ hashFiles('unm/unm.config') }}
+
+    - name: Report cache status
+      run: |
+        echo "dl 缓存命中        : ${{ steps.dl-cache.outputs.cache-hit }}"
+        echo "宿主工具链缓存命中 : ${{ steps.host-cache.outputs.cache-hit }}"
+        for d in openwrt/dl openwrt/staging_dir openwrt/build_dir; do
+          if [ -d "$d" ]; then
+            printf '%-20s %s\n' "$d" "$(du -sh "$d" | cut -f1)"
+          else
+            printf '%-20s %s\n' "$d" "空"
+          fi
+        done
+        # 标准 runner 只有 14 GB 磁盘, 缓存 + 编译产物很容易吃满。
+        avail=$(df -Pk / | awk 'NR==2{print int($4/1024)}')
+        echo "根分区可用         : ${avail} MB"
+        if [ "${avail:-0}" -lt 6000 ]; then
+          echo "::warning::可用磁盘仅 ${avail} MB, 完整编译可能中途写满; 若真失败, 可临时注释掉 dl 缓存那一步"
+        fi
 
     - name: Update and install feeds
       run: |
@@ -217,24 +389,6 @@ jobs:
         [ $fail -eq 0 ] || exit 1
         echo "OK: 配置校验通过(board/subtarget 与关键包均已就位)"
 
-    # 目标名说明(2026-11-09 查证, 修正前两轮的误判):
-    #   package/<源码目录>/compile 与 package/<包目录名>/compile(include/subdir.mk 的
-    #   diralias 别名, 如 package/node/compile) 都能用, 第六次运行的日志已经证明后者会
-    #   正常展开 node 的依赖闭包。报错里出现的 include/toplevel.mk:231 并不是"目标不存在",
-    #   它只是 `%::` 规则里被委派的 recipe 行 —— OpenWrt 所有目标都走这条规则进子 make。
-    #
-    #   真正的问题是: 子 make 的图里同时排进了 package/kernel/linux/compile, 而内核从没编过,
-    #   于是报 linux-6.x.y/.config 打不开、mdio_devres.ko 缺失。见下方 "Build kernel" 步骤。
-    #
-    #   目标名的正确拼法(2026-11-09 第七次运行日志证实, 此前拼错导致 package/package/...):
-    #   include/scan.mk 第 9 行 `SCAN_DIR ?= package`, 第 50 行 `echo Source-Makefile: $(SCAN_DIR)/$(2)/Makefile`
-    #   —— 也就是说 tmp/.packageinfo 里的 Source-Makefile **本身就是 `package/<相对目录>/Makefile`**,
-    #   已经带了 package/ 前缀。再拼一次 "package/" 就变成 package/package/..., 子 make 直接
-    #   报 `No rule to make target`。正确做法是先把前缀剥掉, 得到相对目录, 再拼一次。
-    #
-    #   相对目录的权威来源是 tmp/.packagedeps 的 `package-y += <相对目录>`(scripts/package-metadata.pl:476)
-    #   与 `$(curdir)/<相对目录>/compile += ...`(:542), 这两处的路径都不带 package/ 前缀,
-    #   正好和 include/subdir.mk 生成目标 `$(curdir)/$(bd)/compile` 的语义对齐。
     - name: Resolve package build targets
       run: |
         cd openwrt
@@ -348,19 +502,6 @@ jobs:
         make tools/install -j$(nproc) || make tools/install -j1
         make toolchain/install -j$(nproc) || make toolchain/install -j1
 
-    # 为什么必须先编内核(2026-11-09 第六次运行日志证实):
-    #   编译 node 的目标图里包含 package/kernel/linux/compile —— 这个源包负责把内核
-    #   build_dir 里的 *.ko 打成 kmod-*.ipk。内核没编过时, 它连
-    #   build_dir/target-*/linux-*/linux-x.y.z/.config 都打不开, 随即报
-    #   "module '.../mdio_devres.ko' is missing" 并让整步失败。
-    #
-    #   这不是配置缺符号, 而是构建顺序问题: 根 Makefile 里写着
-    #       $(package/stamp-compile): $(target/stamp-compile)
-    #   即"包在 target 之后"。`make world` 会自动保证这一点, 单独编某个包则不会,
-    #   必须手动先把 target/linux 编出来。
-    #
-    #   代价: 2 核 runner 上约 20-30 分钟。不编内核就没有 .ko, kmod 打包必然失败,
-    #   没有任何配置能绕过这一环。
     - name: Build kernel for target
       run: |
         cd openwrt
@@ -386,9 +527,6 @@ jobs:
         fi
         echo "OK: 内核已就绪, .ko 数量 = $(find "$KBUILD_DIR" -name '*.ko' | wc -l)"
 
-    # 失败时把决定性错误行以 ::error:: 注解发出。
-    # 注解接口是公开可读的, 而 job 日志要仓库权限才能下载(403 Must have admin rights),
-    # 这样即使拿不到日志也能定位; 注解每步上限 10 条、单条约 64KB, 只取尾部 5 行。
     - name: Compile node runtime
       run: |
         cd openwrt
@@ -486,7 +624,7 @@ jobs:
         du -sh .
 
     - name: Upload ipk artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: unm-ipk-v${{ env.UNM_VER }}-${{ env.SHORT_COMMIT }}
         path: |
@@ -509,6 +647,8 @@ jobs:
             echo "> 若与固件构建时的 commit 不同, node 的运行时依赖可能对不上。"
             echo "> 请带 \`lede_commit\` 重跑一次, 值取固件 workflow 运行页 Summary 里的那串。"
           fi
+          echo "- runner 镜像: ubuntu-26.04(公共预览)"
+          echo "- 缓存: \`dl\`=${{ steps.dl-cache.outputs.cache-hit }} / 宿主工具链=${{ steps.host-cache.outputs.cache-hit }}"
           echo ""
           echo "插件本体为 \`PKGARCH:=all\`,node 为 x86_64;两台路由器同一份 ipk 通用。"
           echo ""
