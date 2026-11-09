@@ -47,12 +47,12 @@ sed -i "s/luci-theme-bootstrap/luci-theme-argon/g" feeds/luci/collections/luci/M
 # 替换 zerotier 为 immortalwrt 版本
 # ============================================
 # 删除 coolsnowwolf 的 zerotier 包
-rm -rf feeds/packages/net/zerotier
+#rm -rf feeds/packages/net/zerotier
 
 # 从 immortalwrt 拉取 zerotier（git sparse-checkout，只下载 net/zerotier 文件夹）
-git clone --depth 1 --filter=blob:none --sparse https://github.com/immortalwrt/packages.git /tmp/immortalwrt-packages
-cd /tmp/immortalwrt-packages
-git sparse-checkout set net/zerotier
-cd -
-cp -r /tmp/immortalwrt-packages/net/zerotier feeds/packages/net/
-rm -rf /tmp/immortalwrt-packages
+#git clone --depth 1 --filter=blob:none --sparse https://github.com/immortalwrt/packages.git /tmp/immortalwrt-packages
+#cd /tmp/immortalwrt-packages
+#git sparse-checkout set net/zerotier
+#cd -
+#cp -r /tmp/immortalwrt-packages/net/zerotier feeds/packages/net/
+#rm -rf /tmp/immortalwrt-packages
