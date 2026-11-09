@@ -241,13 +241,11 @@ jobs:
         retain_days: 0
         keep_minimum_runs: 2
 
-    - name: Remove old MJ releases
+    - name: Remove old Releases
+      uses: dev-drprasad/delete-older-releases@master
       if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      with:
+        keep_latest: 6
+        delete_tags: true
       env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: |
-        gh release list --limit 100 --json tagName --jq '.[].tagName' \
-          | grep '^MJ-' | sort -r | tail -n +4 \
-          | while read -r tag; do
-              [ -n "$tag" ] && gh release delete "$tag" --yes --cleanup-tag
-            done
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
