@@ -116,6 +116,28 @@ jobs:
         git clone $REPO_URL -b $REPO_BRANCH openwrt
         ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
         echo "LEDE_COMMIT=$(git -C openwrt rev-parse HEAD)" >> $GITHUB_ENV
+        echo "SHORT_COMMIT=$(git -C openwrt rev-parse --short HEAD)" >> $GITHUB_ENV
+        git -C openwrt log -1 --format='LEDE commit: %H%n提交日期: %ci%n标题: %s'
+
+    # 把 commit 显式打到运行页, 免得下次构建插件时还要翻 release 正文去找
+    - name: Record LEDE commit
+      run: |
+        {
+          echo "## 本固件对应的 LEDE commit"
+          echo ""
+          echo '```'
+          echo "$LEDE_COMMIT"
+          echo '```'
+          echo ""
+          echo "构建网易云解锁 ipk 时, 把上面这串填进 \`Build UNM ipk (standalone)\` 的 \`lede_commit\`,"
+          echo "或在命令行执行:"
+          echo ""
+          echo '```sh'
+          echo "gh workflow run build_unm_pkg.yml -f lede_commit=$LEDE_COMMIT"
+          echo '```'
+          echo ""
+          echo "commit 不同则 ipk 不能通用: node 链接的 libc/libstdc++/openssl 版本由该 commit 决定。"
+        } >> $GITHUB_STEP_SUMMARY
 
     - name: Load custom feeds
       run: |
