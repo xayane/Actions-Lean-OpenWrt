@@ -14,7 +14,7 @@ rm -rf package/feeds/luci/luci-theme-argon
 rm -rf package/feeds/luci/luci-app-argon-config
 rm -rf package/feeds/luci/luci-theme-infinityfreedom
 rm -rf package/feeds/luci/luci-theme-design
-rm -rf package/feeds/luci/luci-app-unblockneteasemusic
+#rm -rf package/feeds/luci/luci-app-unblockneteasemusic
 git clone https://github.com/xiaoqingfengATGH/luci-theme-infinityfreedom.git package/feeds/luci/luci-theme-infinityfreedom
 git clone https://github.com/SAENE/luci-theme-design.git package/feeds/luci/luci-theme-design
 git clone -b master https://github.com/jerrykuku/luci-theme-argon.git package/feeds/luci/luci-theme-argon
@@ -26,7 +26,7 @@ git clone https://github.com/sirpdboy/luci-app-kucat-config package/feeds/luci/l
 
 #添加软件
 git clone https://github.com/zzsj0928/luci-app-pushbot package/feeds/luci/luci-app-pushbot
-git clone https://github.com/UnblockNeteaseMusic/luci-app-unblockneteasemusic package/feeds/luci/luci-app-unblockneteasemusic
+#git clone https://github.com/UnblockNeteaseMusic/luci-app-unblockneteasemusic package/feeds/luci/luci-app-unblockneteasemusic
 
 #修改初始设置
 #[ -e package/lean/default-settings/files/zzz-default-settings ] && sed -i "5a\ \tset system.@system[0].hostname=ironman" package/lean/default-settings/files/zzz-default-settings
