@@ -33,6 +33,15 @@ env:
   UPLOAD_RELEASE: true
   TZ: Asia/Shanghai
 
+# 最小权限: 只读仓库即可编译, 发布 release 需要 contents: write
+permissions:
+  contents: write
+
+# 同一分支只跑一个, 避免定时任务与手工触发抢 runner、互相覆盖 release 标签
+concurrency:
+  group: mj-firmware-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   check:
     name: Check for source code updates
@@ -99,15 +108,16 @@ jobs:
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
-        sudo apt-get -qq update && sudo apt-get -qq upgrade
-        sudo -E apt -y install ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler flex gawk gcc-multilib g++-multilib gettext genisoimage git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libpython3-dev libreadline-dev libssl-dev libtool llvm lrzsz msmtp ninja-build p7zip p7zip-full patch pkgconf python3 python3-pyelftools python3-setuptools qemu-utils rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
+        sudo -E apt-get update
+        sudo -E apt-get -y install ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler flex gawk gcc-multilib g++-multilib gettext genisoimage git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libpython3-dev libreadline-dev libssl-dev libtool llvm lrzsz msmtp ninja-build p7zip p7zip-full patch pkgconf python3 python3-pyelftools python3-setuptools qemu-utils rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
         sudo -E systemctl daemon-reload
-        sudo apt-get -qq install $(cat $DEPENDENCIES)
-        sudo apt-get -qq autoremove --purge
         sudo apt-get -qq clean
         sudo timedatectl set-timezone "$TZ"
         sudo mkdir -p /workdir
-        sudo chown $USER:$GROUPS /workdir
+        sudo chown "$USER:$GROUPS" /workdir
+        echo "----- 依赖检查 -----"
+        for b in gcc g++ make python3 rsync unzip; do printf '%-8s %s\n' "$b" "$(command -v $b || echo MISSING)"; done
+        df -hT /
 
     - name: Clone source code
       working-directory: /workdir
@@ -160,32 +170,104 @@ jobs:
         cd openwrt
         $GITHUB_WORKSPACE/$DIY_P2_SH
 
+    # 新增: 断言 node / unblockneteasemusic 均未进入固件配置
+    - name: Verify node is excluded from firmware
+      run: |
+        cd openwrt
+        make defconfig
+        echo "----- node / unblockneteasemusic 断言 -----"
+        if grep -qE '^CONFIG_PACKAGE_(node|node-npm)=y' .config; then
+          echo "::error::node 仍被选中, 说明还有包依赖它"
+          grep -nE '^CONFIG_PACKAGE_(node|node-npm)=y' .config
+          exit 1
+        fi
+        if grep -qE '^CONFIG_PACKAGE_luci-app-unblockneteasemusic=y' .config; then
+          echo "::error::luci-app-unblockneteasemusic 仍在固件配置中"
+          exit 1
+        fi
+        if ! grep -qE '^CONFIG_PACKAGE_dnsmasq-full=y' .config; then
+          echo "::warning::dnsmasq-full 未被选中, 安装 UNM ipk 时会发生 dnsmasq 替换"
+        fi
+        # 统一到 feed 版 v3.4: 插件目录必须保持 feeds 的符号链接形态,
+        # 若变成真实目录说明被 diy 脚本 clone 覆盖成了上游旧版(v2.15, ipset 分流)
+        UNM_DIR=package/feeds/luci/luci-app-unblockneteasemusic
+        if [ -d "$UNM_DIR" ] && [ ! -L "$UNM_DIR" ]; then
+          echo "::error::${UNM_DIR} 是真实目录, 疑似被 clone 覆盖成上游旧版"
+          exit 1
+        fi
+        # 运行时依赖检查(缺任何一项, 插件 ipk 装上去也跑不起来)
+        # firewall4/nftables-json/ucode: v3.4 的 fw4+nftset 分流; ucode 提供 utpl 模板渲染器
+        # libstdcpp/libuv: node 的 C++ 运行时与事件循环库
+        for sym in firewall4 nftables-json ucode libstdcpp libuv; do
+          if ! grep -qE "^CONFIG_PACKAGE_${sym}=y" .config; then
+            echo "::warning::运行时依赖 CONFIG_PACKAGE_${sym} 未选中, 插件可能无法启动"
+          fi
+        done
+        echo "OK: 固件不含 node, 不含 unblockneteasemusic"
+
     - name: Download package
       id: package
       run: |
         cd openwrt
         make defconfig
-        make download -j8
-        find dl -size -1024c -exec ls -l {} \;
-        find dl -size -1024c -exec rm -f {} \;
+        make download -j8 || make download -j1 V=s
+        # 清掉下载失败留下的空壳文件(小于 1KB), 否则后续编译会报校验失败
+        find dl -size -1024c -type f -print -delete || true
 
     - name: Compile the firmware
       id: compile
       run: |
         cd openwrt
-        echo -e "$(nproc) thread compile"
-        make -j$(nproc) || make -j1 || make -j1 V=s
+        # runner 实际用 `/usr/bin/bash -e {0}`, 默认**没有** pipefail;
+        # 不显式开启的话 `make | tee` 的退出码是 tee 的 0, 编译失败会被当成成功。
+        set -o pipefail
+        echo "使用 $(nproc) 线程编译"
+        # tee 出一份完整日志, 失败时用于定位
+        if ! make -j"$(nproc)" 2>&1 | tee build.log; then
+          echo "::warning::并行编译失败, 用 -j1 V=s 重试一次以获取确定的错误位置"
+          if ! make -j1 V=s 2>&1 | tee -a build.log; then
+            echo "::error::编译失败, 详见 artifact 中的 build.log"
+            exit 1
+          fi
+        fi
         echo "status=success" >> $GITHUB_OUTPUT
-        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
-        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+        echo "----- 产物清单 -----"
+        ls -lh bin/targets/*/*/ 2>/dev/null || true
+        # x86 Generic 没有 DEVICE_* 项, 该 grep 无匹配是正常的, 不能让步骤失败
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config 2>/dev/null \
+          | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME || true
+        if [ -s DEVICE_NAME ]; then
+          echo "DEVICE_NAME=_$(head -1 DEVICE_NAME)" >> $GITHUB_ENV
+        fi
         echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
 
     - name: Check space usage
       if: (!cancelled())
       run: df -hT
 
+    # 失败时把关键信息直接打到日志里, 不必下载 artifact 就能判断原因
+    - name: Report build failure
+      if: failure()
+      run: |
+        echo "=========== build.log 尾部 200 行 ==========="
+        tail -n 200 openwrt/build.log 2>/dev/null || echo "(build.log 不存在, 说明失败发生在编译之前)"
+        echo "=========== bin 目录 ==========="
+        ls -l openwrt/bin 2>/dev/null || echo "(bin 不存在: 编译未完成)"
+        echo "=========== 磁盘 ==========="
+        df -hT /
+
+    - name: Upload build log on failure
+      if: failure()
+      uses: actions/upload-artifact@v7
+      with:
+        name: build-log-${{ env.REPO_NAME }}-${{ github.run_id }}
+        path: |
+          openwrt/build.log
+          openwrt/.config
+        if-no-files-found: ignore
+
     - name: Upload bin directory
-      uses: actions/upload-artifact@main
+      uses: actions/upload-artifact@v7
       if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
       with:
         name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
@@ -193,32 +275,45 @@ jobs:
 
     - name: Organize files
       id: organize
-      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_FIRMWARE == 'true'
       run: |
-        cd openwrt/bin/targets/*/*
+        # 不用 cd 通配符: 目录不存在时给出可读的报错, 而不是 No such file or directory
+        TARGET_DIR=$(echo openwrt/bin/targets/*/* | cut -d' ' -f1)
+        if [ ! -d "$TARGET_DIR" ]; then
+          echo "::error::未找到固件输出目录, 编译未产出镜像"
+          ls -R openwrt/bin 2>/dev/null | head -50 || echo "(bin 不存在)"
+          exit 1
+        fi
+        cd "$TARGET_DIR"
         rm -rf packages
+        ls -lh
         echo "FIRMWARE=$PWD" >> $GITHUB_ENV
         echo "status=success" >> $GITHUB_OUTPUT
 
     - name: Upload firmware directory
-      uses: actions/upload-artifact@main
-      if: steps.organize.outputs.status == 'success' && !cancelled()
+      uses: actions/upload-artifact@v7
+      if: steps.organize.outputs.status == 'success'
       with:
         name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
         path: ${{ env.FIRMWARE }}
 
     - name: Generate release tag
       id: tag
-      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      if: steps.organize.outputs.status == 'success' && env.UPLOAD_RELEASE == 'true'
       run: |
-        echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
-        touch release.txt
-        [ ${UPLOAD_GOFILE} = true && ${{ steps.gofile.outputs.url }} ] && echo "🔗 [GoFile](${{ steps.gofile.outputs.url }})" >> release.txt
+        echo "release_tag=GXT-$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
+        {
+          echo "【GXT】固件不含 luci-app-unblockneteasemusic 与 node。"
+          echo ""
+          echo "- LEDE commit: \`${LEDE_COMMIT}\`"
+          echo ""
+          echo "配套的网易云解锁 ipk(v3.4, 与 MJ 通用)请在 Build UNM ipk (standalone) 中使用同一 commit 构建。"
+        } > release.txt
         echo "status=success" >> $GITHUB_OUTPUT
 
     - name: Upload firmware to release
-      uses: softprops/action-gh-release@master
-      if: steps.tag.outputs.status == 'success' && !cancelled()
+      uses: softprops/action-gh-release@v3
+      if: steps.tag.outputs.status == 'success'
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
@@ -226,17 +321,25 @@ jobs:
         body_path: release.txt
         files: ${{ env.FIRMWARE }}/*
 
-    - name: Delete workflow runs
-      uses: Mattraks/delete-workflow-runs@main
-      with:
-        retain_days: 0
-        keep_minimum_runs: 2
-
-    - name: Remove old Releases
-      uses: dev-drprasad/delete-older-releases@master
-      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
-      with:
-        keep_latest: 6
-        delete_tags: true
+    - name: Delete old workflow runs
+      if: steps.tag.outputs.status == 'success'
       env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        gh run list --workflow x86_lean_GXT.yml --limit 60 \
+          --json databaseId --jq '.[].databaseId' \
+          | tail -n +3 \
+          | while read -r id; do gh run delete "$id" || true; done
+
+    # 只清理 GXT- 前缀的 release, 避免把 MJ 那台的 release 一并删掉
+    # 必须挂在 tag 成功之后: 否则编译失败时也会跑, 白白删掉历史 release
+    - name: Remove old GXT releases
+      if: steps.tag.outputs.status == 'success'
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        gh release list --limit 100 --json tagName --jq '.[].tagName' \
+          | grep '^GXT-' | sort -r | tail -n +4 \
+          | while read -r tag; do
+              [ -n "$tag" ] && gh release delete "$tag" --yes --cleanup-tag
+            done
