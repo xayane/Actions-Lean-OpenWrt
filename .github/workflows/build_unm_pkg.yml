@@ -1,0 +1,253 @@
+#=================================================
+# 基于 https://github.com/xayane/Actions-Lean-OpenWrt 调整
+# 用途: 单独编译 luci-app-unblockneteasemusic(JS 版) 及其运行时依赖 node, 产出 ipk
+#
+# 插件来源: LEDE luci feed 自带版本(v3.4, nftset + firewall4)。
+#   MJ 与 GXT 两台已统一到该版本, 因此只需跑一次:
+#     - 插件本体 LUCI_PKGARCH:=all, 与架构无关;
+#     - node 的 ipk 两台同架构(x86_64)通用。
+#
+# lede_commit 必须与对应固件构建使用的 commit 一致, 否则 node 链接的
+# libc/libstdc++/openssl 版本可能与固件不匹配, opkg 会报符号缺失。
+#=================================================
+
+name: Build UNM ipk (standalone)
+
+on:
+  workflow_dispatch:
+    inputs:
+      lede_commit:
+        description: "LEDE commit: 40 位或短哈希均可, 建议填固件构建用的; 留空=分支 HEAD"
+        required: false
+        default: ""
+
+env:
+  REPO_URL: https://github.com/coolsnowwolf/lede
+  REPO_BRANCH: master
+  CONFIG_FILE: unm/unm.config
+  UNM_PKG: luci-app-unblockneteasemusic
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Free Disk Space (Ubuntu)
+      uses: jlumbroso/free-disk-space@main
+      with:
+        preinstalled-runtimes: true
+        docker-images: true
+        android: true
+        dotnet: true
+        haskell: true
+        large-packages: true
+        swap-storage: true
+
+    - name: Install build dependencies
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo -E apt update
+        sudo -E apt -y install ack antlr3 asciidoc autoconf automake autopoint binutils bison \
+          build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler flex gawk \
+          gcc-multilib g++-multilib gettext genisoimage git gperf haveged help2man intltool \
+          libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev \
+          libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libpython3-dev \
+          libreadline-dev libssl-dev libtool llvm lrzsz msmtp ninja-build p7zip p7zip-full \
+          patch pkgconf python3 python3-pyelftools python3-setuptools qemu-utils rsync \
+          scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget \
+          xmlto xxd zlib1g-dev
+        sudo timedatectl set-timezone "$TZ"
+        df -hT
+
+    - name: Clone LEDE
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        RAW_COMMIT: ${{ inputs.lede_commit }}
+      run: |
+        git clone --depth 1 --branch "$REPO_BRANCH" --single-branch "$REPO_URL" openwrt
+        cd openwrt
+
+        # 去掉手抖带进来的空格/换行
+        RAW="$(printf '%s' "$RAW_COMMIT" | tr -d '[:space:]')"
+
+        if [ -z "$RAW" ]; then
+          echo "::warning::lede_commit 未填写, 本次使用 ${REPO_BRANCH} 当前 HEAD"
+          echo "::warning::若它与固件构建时的 commit 不同, node 链的 libstdc++/libssl 可能对不上, 路由器上会报符号缺失"
+          echo "LEDE_PINNED=no" >> $GITHUB_ENV
+        else
+          # 只接受 7-40 位十六进制。路由器 /etc/openwrt_release 里
+          # DISTRIB_REVISION='r28000-abc1234' 末尾那串短哈希也可以直接填。
+          case "$RAW" in
+            *[!0-9a-fA-F]*) echo "::error::lede_commit 含非十六进制字符: $RAW"; exit 1 ;;
+          esac
+          [ "${#RAW}" -ge 7 ] || { echo "::error::lede_commit 太短(${#RAW} 位), 至少 7 位"; exit 1; }
+
+          FULL=""
+          if [ "${#RAW}" -eq 40 ]; then
+            FULL="$RAW"
+          else
+            # 注意: GitHub API 不支持用短哈希查 commit(会直接返回 "No commit found for SHA"),
+            # 所以在分支历史里按前缀匹配。固件是新近构建的, 最近 500 个 commit 足够覆盖。
+            page=1
+            while [ "$page" -le 5 ] && [ -z "$FULL" ]; do
+              list="$(gh api "repos/coolsnowwolf/lede/commits?sha=${REPO_BRANCH}&per_page=100&page=${page}" --jq '.[].sha' 2>/dev/null || true)"
+              for s in $list; do
+                case "$s" in
+                  "$RAW"*) FULL="$s"; break ;;
+                esac
+              done
+              page=$((page + 1))
+            done
+            if [ -z "$FULL" ]; then
+              echo "::error::在 ${REPO_BRANCH} 最近 500 个 commit 里找不到 $RAW"
+              echo "::error::请到固件 workflow 运行页 Summary 复制完整 40 位 commit 再试"
+              exit 1
+            fi
+            echo "短哈希 ${RAW} -> 完整 ${FULL}"
+          fi
+
+          # 优先只取这一个 commit; 服务器不允许按 sha 取时逐级加深
+          git fetch --depth 1 origin "$FULL" 2>/dev/null \
+            || git fetch --depth 500 origin "$REPO_BRANCH" 2>/dev/null \
+            || git fetch origin
+          git checkout -q "$FULL"
+          GOT="$(git rev-parse HEAD)"
+          if [ "$GOT" != "$FULL" ]; then
+            echo "::error::checkout 后 HEAD($GOT) 与请求的 commit($FULL) 不一致"; exit 1
+          fi
+          echo "已固定到固件侧 commit: $GOT"
+          echo "LEDE_PINNED=yes" >> $GITHUB_ENV
+        fi
+
+        echo "LEDE_COMMIT=$(git rev-parse HEAD)" >> $GITHUB_ENV
+        echo "SHORT_COMMIT=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+        git log -1 --format='LEDE commit: %H%n提交日期: %ci%n标题: %s'
+
+    - name: Update and install feeds
+      run: |
+        cd openwrt
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    - name: Check UNM package in feed
+      run: |
+        cd openwrt
+        PKG_DIR="package/feeds/luci/${UNM_PKG}"
+        [ -e "$PKG_DIR/Makefile" ] || {
+          echo "::error::luci feed 中找不到 ${UNM_PKG}, 请检查 feeds.conf.default 的 luci 分支"
+          exit 1
+        }
+        # feed 版 Makefile 用相对路径 include ../../luci.mk,
+        # 因此必须是 feeds 的符号链接形态; 若被替换成真实目录会报找不到 luci.mk
+        if [ -L "$PKG_DIR" ]; then
+          echo "OK: ${PKG_DIR} 是符号链接(相对 include 可用)"
+        else
+          echo "::warning::${PKG_DIR} 不是符号链接, 若编译时报找不到 luci.mk 请检查是否被 clone 覆盖"
+        fi
+        echo "----- 待编译版本 -----"
+        grep -E '^(PKG_VERSION|PKG_RELEASE|LUCI_TITLE|LUCI_DEPENDS)' \
+          "$PKG_DIR/Makefile" | tee /tmp/unm-meta.txt
+        grep -q 'JavaScript' "$PKG_DIR/Makefile" \
+          || echo "::warning::标题不含 JavaScript, 可能不是预期的 JS 版插件"
+        # 确认分流实现是 fw4 的 nftset 模板(而非旧的 ipset)
+        if grep -q 'nftables.ut' "$PKG_DIR/root/etc/init.d/${UNM_PKG#luci-app-}"; then
+          echo "分流实现: nftset (fw4)"
+        else
+          echo "::warning::未在 init.d 中检测到 nftables.ut, 分流路径可能与预期不同"
+        fi
+        UNM_VER="$(sed -n 's/^PKG_VERSION:=//p' /tmp/unm-meta.txt | head -1)"
+        [ -n "$UNM_VER" ] || UNM_VER="unknown"
+        echo "UNM_VER=${UNM_VER}" >> $GITHUB_ENV
+
+    - name: Apply config
+      run: |
+        cd openwrt
+        cp "$GITHUB_WORKSPACE/$CONFIG_FILE" .config
+        make defconfig
+
+    - name: Verify configuration
+      run: |
+        cd openwrt
+        fail=0
+        grep -qE '^CONFIG_TARGET_x86_64_Generic=y' .config || { echo "::error::target 配置丢失"; fail=1; }
+        grep -qE "^CONFIG_PACKAGE_${UNM_PKG}=y" .config || { echo "::error::unblockneteasemusic 未选中"; fail=1; }
+        grep -qE '^CONFIG_PACKAGE_node=y' .config || { echo "::error::node 未选中, 产物将缺少运行时"; fail=1; }
+        # v3.4 的 LUCI_DEPENDS 含 @PACKAGE_firewall4, 缺它则包根本不可选
+        grep -qE '^CONFIG_PACKAGE_firewall4=y' .config || { echo "::error::firewall4 未选中(插件依赖 @PACKAGE_firewall4)"; fail=1; }
+        [ $fail -eq 0 ] || exit 1
+        echo "----- 关键配置 -----"
+        grep -E "^CONFIG_(TARGET_x86_64_Generic|PACKAGE_node|PACKAGE_node-npm|PACKAGE_${UNM_PKG}|PACKAGE_dnsmasq-full|PACKAGE_firewall4|PACKAGE_nftables-json|PACKAGE_ucode)=" .config
+        echo "----- node 版本选择 -----"
+        grep -E '^CONFIG_NODEJS' .config || true
+
+    - name: Build tools and toolchain
+      run: |
+        cd openwrt
+        make tools/install -j$(nproc) || make tools/install -j1
+        make toolchain/install -j$(nproc) || make toolchain/install -j1
+
+    - name: Compile node runtime
+      run: |
+        cd openwrt
+        make package/feeds/packages/node/compile V=s -j$(nproc) \
+          || make package/feeds/packages/node/compile V=s -j1
+
+    - name: Compile luci-app-unblockneteasemusic
+      run: |
+        cd openwrt
+        make package/feeds/luci/luci-app-unblockneteasemusic/compile V=s -j$(nproc) \
+          || make package/feeds/luci/luci-app-unblockneteasemusic/compile V=s -j1
+
+    - name: Collect ipk and inspect control data
+      run: |
+        cd openwrt
+        mkdir -p out
+        find bin/packages -name '*.ipk' -exec cp -f {} out/ \;
+        cd out
+        ls -lh
+        echo "=========== 各包 Depends ==========="
+        for f in *.ipk; do
+          echo "=== $f"
+          ar p "$f" control.tar.gz 2>/dev/null | tar -xzO ./control 2>/dev/null | sed -n '1,15p' || echo "(无法解析)"
+        done
+        sha256sum *.ipk > SHA256SUMS
+        du -sh .
+
+    - name: Upload ipk artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: unm-ipk-v${{ env.UNM_VER }}-${{ env.SHORT_COMMIT }}
+        path: |
+          openwrt/out
+          openwrt/bin/packages/x86_64
+        if-no-files-found: error
+
+    - name: Write build summary
+      run: |
+        {
+          echo "## UNM ipk 构建完成(MJ / GXT 通用)"
+          echo ""
+          echo "- 插件版本: \`v${UNM_VER}\`(LEDE luci feed, JS 版)"
+          echo "- 分流机制: nftset + firewall4"
+          if [ "${LEDE_PINNED}" = "yes" ]; then
+            echo "- LEDE commit: \`${LEDE_COMMIT}\`(已按输入固定)"
+          else
+            echo "- LEDE commit: \`${LEDE_COMMIT}\` **未固定**, 用的是分支 HEAD"
+            echo ""
+            echo "> 若与固件构建时的 commit 不同, node 的运行时依赖可能对不上。"
+            echo "> 请带 \`lede_commit\` 重跑一次, 值取固件 workflow 运行页 Summary 里的那串。"
+          fi
+          echo ""
+          echo "插件本体为 \`PKGARCH:=all\`,node 为 x86_64;两台路由器同一份 ipk 通用。"
+          echo ""
+          echo "安装前确认路由器侧:"
+          echo "- \`fw4\` 在跑: \`fw4 -v\` 或 \`nft list ruleset | head\`"
+          echo "- 模板引擎存在: \`command -v utpl\`(由 \`ucode\` 包提供, firewall4 已依赖它)"
+          echo ""
+          echo "安装: 把 artifact 内全部 ipk 上传到路由器 /tmp/unm-ipk, 执行 tools/install-unm-on-router.sh"
+        } >> $GITHUB_STEP_SUMMARY
