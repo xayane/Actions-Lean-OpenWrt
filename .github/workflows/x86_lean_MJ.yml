@@ -89,7 +89,7 @@ jobs:
         sudo -E systemctl daemon-reload
         sudo apt-get -qq install $(cat $DEPENDENCIES)
         sudo apt-get -qq autoremove --purge
-        sudo apt-get -qq clean"
+        sudo apt-get -qq clean
         sudo timedatectl set-timezone "$TZ"
         sudo mkdir -p /workdir
         sudo chown $USER:$GROUPS /workdir
