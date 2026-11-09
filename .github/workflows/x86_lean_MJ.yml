@@ -21,7 +21,7 @@ on:
     - cron: '30 1 * * *'
 
 env:
-  REPO_NAME: lean x64 Openwrt
+  REPO_NAME: lean-x64-Openwrt
   REPO_URL: https://github.com/coolsnowwolf/lede
   REPO_BRANCH: master
   FEEDS_CONF: feeds.conf.default
@@ -142,15 +142,17 @@ jobs:
         sudo -E apt -y autoremove --purge
         sudo -E apt clean
         sudo timedatectl set-timezone "$TZ"
-        sudo mkdir -p /home/runner/work/Actions-Lean-OpenWrt/Actions-Lean-OpenWrt/workdir
-        sudo chown $USER:$GROUPS /home/runner/work/Actions-Lean-OpenWrt/Actions-Lean-OpenWrt/workdir
+        sudo mkdir -p ${{ github.workspace }}/workdir
+        sudo chown $USER:$GROUPS ${{ github.workspace }}/workdir
 
+        
     - name: Clone source code
-      working-directory: /home/runner/work/Actions-Lean-OpenWrt/Actions-Lean-OpenWrt/workdir
+      working-directory: ${{ github.workspace }}/workdir
       run: |
         df -hT $PWD
         git clone $REPO_URL -b $REPO_BRANCH openwrt
-        ln -sf /home/runner/work/Actions-Lean-OpenWrt/Actions-Lean-OpenWrt/workdir/openwrt $GITHUB_WORKSPACE/openwrt
+        ln -sf ${{ github.workspace }}/workdir/openwrt $GITHUB_WORKSPACE/openwrt
+        echo "LEDE_COMMIT=$(git -C openwrt rev-parse HEAD)" >> $GITHUB_ENV
 
     - name: Load custom feeds
       run: |
@@ -245,11 +247,13 @@ jobs:
         retain_days: 0
         keep_minimum_runs: 2
 
-    - name: Remove old Releases
-      uses: dev-drprasad/delete-older-releases@master
+    - name: Remove old MJ releases
       if: env.UPLOAD_RELEASE == 'true' && !cancelled()
-      with:
-        keep_latest: 3
-        delete_tags: true
       env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        gh release list --limit 100 --json tagName --jq '.[].tagName' \
+          | grep '^MJ-' | sort -r | tail -n +4 \
+          | while read -r tag; do
+              [ -n "$tag" ] && gh release delete "$tag" --yes --cleanup-tag
+            done
