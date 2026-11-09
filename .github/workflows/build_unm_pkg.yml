@@ -187,12 +187,19 @@ jobs:
         grep -E '^CONFIG_NODEJS' .config || true
 
         fail=0
-
+        # node 的 ABI 只由 board + subtarget 决定(它们决定 ARCH、工具链、libc/libstdc++/libssl),
+        # profile 只影响镜像打包与 DEFAULT_PACKAGES, 单包编译不需要它。
+        # 所以硬断言只落在 board/subtarget 上。
         grep -qE '^CONFIG_TARGET_x86=y' .config \
           || { echo "::error::board 未选中: CONFIG_TARGET_x86 缺失"; fail=1; }
         grep -qE '^CONFIG_TARGET_x86_64=y' .config \
           || { echo "::error::subtarget 未选中: CONFIG_TARGET_x86_64 缺失"; fail=1; }
 
+        # profile 的符号名随源码版本变过:
+        #   旧版 target/linux/x86/64/target.mk 有 `define Profile/Generic` -> CONFIG_TARGET_x86_64_Generic
+        #   新版只剩 image/64.mk 的 `define Device/generic` + TARGET_DEVICES -> CONFIG_TARGET_x86_64_DEVICE_generic
+        # 当前 LEDE master 的 target.mk 里已经没有 Profile/Generic, 所以只断言 Generic 必然失败。
+        # 这里按"三选一命中即可, 但一个 profile 都没有就真错了"来判。
         if grep -qE '^CONFIG_TARGET_x86_64_(Generic|DEVICE_generic)=y' .config; then
           echo "OK: x86_64 的 Generic profile 已选中"
         elif grep -qE '^CONFIG_TARGET_x86_64_[A-Za-z0-9_]+=y' .config; then
@@ -210,58 +217,129 @@ jobs:
         [ $fail -eq 0 ] || exit 1
         echo "OK: 配置校验通过(board/subtarget 与关键包均已就位)"
 
-
-    #   make 内部规则的写法(make -q -p 在顶层 make 里看不到 package 目标, 只会抓到 0 条)。
+    # 目标名说明(2026-11-09 查证, 修正前两轮的误判):
+    #   package/<源码目录>/compile 与 package/<包目录名>/compile(include/subdir.mk 的
+    #   diralias 别名, 如 package/node/compile) 都能用, 第六次运行的日志已经证明后者会
+    #   正常展开 node 的依赖闭包。报错里出现的 include/toplevel.mk:231 并不是"目标不存在",
+    #   它只是 `%::` 规则里被委派的 recipe 行 —— OpenWrt 所有目标都走这条规则进子 make。
+    #
+    #   真正的问题是: 子 make 的图里同时排进了 package/kernel/linux/compile, 而内核从没编过,
+    #   于是报 linux-6.x.y/.config 打不开、mdio_devres.ko 缺失。见下方 "Build kernel" 步骤。
+    #
+    #   目标名的正确拼法(2026-11-09 第七次运行日志证实, 此前拼错导致 package/package/...):
+    #   include/scan.mk 第 9 行 `SCAN_DIR ?= package`, 第 50 行 `echo Source-Makefile: $(SCAN_DIR)/$(2)/Makefile`
+    #   —— 也就是说 tmp/.packageinfo 里的 Source-Makefile **本身就是 `package/<相对目录>/Makefile`**,
+    #   已经带了 package/ 前缀。再拼一次 "package/" 就变成 package/package/..., 子 make 直接
+    #   报 `No rule to make target`。正确做法是先把前缀剥掉, 得到相对目录, 再拼一次。
+    #
+    #   相对目录的权威来源是 tmp/.packagedeps 的 `package-y += <相对目录>`(scripts/package-metadata.pl:476)
+    #   与 `$(curdir)/<相对目录>/compile += ...`(:542), 这两处的路径都不带 package/ 前缀,
+    #   正好和 include/subdir.mk 生成目标 `$(curdir)/$(bd)/compile` 的语义对齐。
     - name: Resolve package build targets
       run: |
         cd openwrt
 
         # 注意: tmp/.packageinfo 里 Source-Makefile 排在 Package: 之前, 必须先缓存再匹配
-        resolve_dir() {
+        # 返回的是 repo 根相对路径, 形如 package/feeds/packages/node
+        resolve_src() {
           awk -v want="$1" '
             /^Source-Makefile: / { p = $2; sub(/\/Makefile$/, "", p) }
             /^Package: / && $2 == want { print p; exit }
           ' tmp/.packageinfo
         }
 
+        # 剥掉开头的 package/, 得到相对 package/ 的目录名(与 .packagedeps 里的写法一致)
+        strip_prefix() {
+          case "$1" in
+            package/*) printf '%s\n' "${1#package/}" ;;
+            *)         printf '%s\n' "$1" ;;
+          esac
+        }
+
+        # 已注册的 builddir 集合: package-y/package- 右侧, 以及 $(curdir)/xxx/compile 左侧
+        if [ -f tmp/.packagedeps ]; then
+          # 两种写法都要归一化成"无前导斜杠的相对目录"
+          #   package-y += feeds/packages/node
+          #   $(curdir)/feeds/packages/node/compile += ...
+          sed -n -e 's/^package-[ym]* += //p' -e 's/^\$(curdir)\(.*\)\/compile += .*/\1/p' \
+            -e 's/^\$(curdir)\(.*\)\/compile:.*/\1/p' tmp/.packagedeps \
+            | tr ' ' '\n' | sed -e 's|^/||' -e '/^$/d' | sort -u > /tmp/registered-dirs.txt
+          echo "tmp/.packagedeps 里已注册的 builddir: $(wc -l < /tmp/registered-dirs.txt) 个"
+        else
+          : > /tmp/registered-dirs.txt
+          echo "::warning::tmp/.packagedeps 不存在, 跳过 builddir 注册性校验"
+        fi
+
         fail=0
         for name in node "$UNM_PKG"; do
-          dir="$(resolve_dir "$name")"
-          if [ -z "$dir" ]; then
+          src="$(resolve_src "$name")"
+          if [ -z "$src" ]; then
             echo "::error::${name} 在 tmp/.packageinfo 里查不到源码目录, 该包可能没被 feeds install 进来"
             fail=1
             continue
           fi
-          if [ ! -f "$dir/Makefile" ]; then
-            echo "::error::${name} 的源码目录 ${dir} 下没有 Makefile"
+          rel="$(strip_prefix "$src")"
+          if [ ! -f "package/${rel}/Makefile" ]; then
+            echo "::error::${name} 的源码目录 package/${rel} 下没有 Makefile"
             fail=1
             continue
           fi
-          echo "${name}: ${dir}  (PKG_VERSION=$(sed -n 's/^PKG_VERSION:=//p' "$dir/Makefile" | head -1))"
+          echo "${name}: Source-Makefile=${src} -> 相对目录 ${rel}  (PKG_VERSION=$(sed -n 's/^PKG_VERSION:=//p' "package/${rel}/Makefile" | head -1))"
         done
         [ $fail -eq 0 ] || exit 1
 
-        NODE_GOAL="package/$(resolve_dir node)/compile"
-        UNM_GOAL="package/$(resolve_dir "$UNM_PKG")/compile"
+        # 拼目标并在 .packagedeps 里核对是否真的注册了
+        # 注意: 本函数用 $( ) 捕获返回值, 所有诊断信息必须走 stderr, 否则会污染目标名
+        make_goal() {
+          local name="$1" rel goal
+          rel="$(strip_prefix "$(resolve_src "$name")")"
+          goal="package/${rel}/compile"
+          if [ -s /tmp/registered-dirs.txt ] && ! grep -qxF "$rel" /tmp/registered-dirs.txt; then
+            {
+              echo "::warning::${rel} 不在 tmp/.packagedeps 的 builddir 列表里, 目标 ${goal} 可能不被识别"
+              echo "           同名候选: $(grep -F "/$(basename "$rel")" /tmp/registered-dirs.txt | head -5 | tr '\n' ' ')"
+            } >&2
+          fi
+          printf '%s\n' "$goal"
+        }
+
+        NODE_GOAL="$(make_goal node)"
+        UNM_GOAL="$(make_goal "$UNM_PKG")"
+        # 双 package/ 前缀是最容易犯的错, 出现就立即失败, 不要等到 40 分钟后再报
+        case "$NODE_GOAL$UNM_GOAL" in
+          *package/package/*)
+            echo "::error::目标名出现重复的 package/ 前缀: $NODE_GOAL / $UNM_GOAL"
+            exit 1
+            ;;
+        esac
         echo "NODE_GOAL=$NODE_GOAL" >> $GITHUB_ENV
         echo "UNM_GOAL=$UNM_GOAL" >> $GITHUB_ENV
         echo "node -> $NODE_GOAL"
         echo "unm  -> $UNM_GOAL"
 
-        NODE_SRC="$(resolve_dir node)"
+        # 备用目标: include/subdir.mk 的 diralias 会为每个 builddir 额外注册
+        # package/<目录名>/compile(如 package/node/compile)。第六次运行的日志已证明这种写法可用,
+        # 只是在同名目录冲突时会指向不确定的那个, 所以只作为主目标失败后的兜底。
+        NODE_REL="$(strip_prefix "$(resolve_src node)")"
+        UNM_REL="$(strip_prefix "$(resolve_src "$UNM_PKG")")"
+        echo "NODE_GOAL_ALT=package/$(basename "$NODE_REL")/compile" >> $GITHUB_ENV
+        echo "UNM_GOAL_ALT=package/$(basename "$UNM_REL")/compile" >> $GITHUB_ENV
+        echo "node 备用 -> package/$(basename "$NODE_REL")/compile"
+        echo "unm  备用 -> package/$(basename "$UNM_REL")/compile"
+
+        # 诊断: 把 node 的编译依赖列表打出来, 并标出有没有 kernel/linux。
+        # tmp/.packagedeps 是 makefile 片段, 路径写成字面量 $(curdir)/<相对目录>/compile
         if [ -f tmp/.packagedeps ]; then
-          DEPS="$(grep -F "\$(curdir)/${NODE_SRC}/compile" tmp/.packagedeps | head -1)"
+          DEPS="$(grep -F "\$(curdir)/${NODE_REL}/compile" tmp/.packagedeps | head -1 || true)"
           DEPS="${DEPS#*= }"   # 去掉 "目标 +=" 前缀, 只留右侧依赖
           echo "--- node 的编译依赖(tmp/.packagedeps) ---"
           echo "$DEPS" | tr ' ' '\n' | grep -F '$(curdir)/' \
-            | sed 's|.*\$(curdir)/||; s|/compile$||' | sed 's/^/  /' | head -30
+            | sed 's|.*\$(curdir)/||; s|/compile$||' | sed 's/^/  /' | head -30 || true
           if echo "$DEPS" | grep -q 'kernel/linux'; then
             echo "=> 依赖里含 kernel/linux: 必须先编内核, 否则 kmod 打包会失败"
           else
             echo "=> 依赖里没有 kernel/linux: 内核步骤属预防性构建"
           fi
-        else
-          echo "::warning::tmp/.packagedeps 不存在, 跳过依赖诊断"
         fi
 
     - name: Build tools and toolchain
@@ -270,6 +348,19 @@ jobs:
         make tools/install -j$(nproc) || make tools/install -j1
         make toolchain/install -j$(nproc) || make toolchain/install -j1
 
+    # 为什么必须先编内核(2026-11-09 第六次运行日志证实):
+    #   编译 node 的目标图里包含 package/kernel/linux/compile —— 这个源包负责把内核
+    #   build_dir 里的 *.ko 打成 kmod-*.ipk。内核没编过时, 它连
+    #   build_dir/target-*/linux-*/linux-x.y.z/.config 都打不开, 随即报
+    #   "module '.../mdio_devres.ko' is missing" 并让整步失败。
+    #
+    #   这不是配置缺符号, 而是构建顺序问题: 根 Makefile 里写着
+    #       $(package/stamp-compile): $(target/stamp-compile)
+    #   即"包在 target 之后"。`make world` 会自动保证这一点, 单独编某个包则不会,
+    #   必须手动先把 target/linux 编出来。
+    #
+    #   代价: 2 核 runner 上约 20-30 分钟。不编内核就没有 .ko, kmod 打包必然失败,
+    #   没有任何配置能绕过这一环。
     - name: Build kernel for target
       run: |
         cd openwrt
@@ -295,23 +386,37 @@ jobs:
         fi
         echo "OK: 内核已就绪, .ko 数量 = $(find "$KBUILD_DIR" -name '*.ko' | wc -l)"
 
-
+    # 失败时把决定性错误行以 ::error:: 注解发出。
+    # 注解接口是公开可读的, 而 job 日志要仓库权限才能下载(403 Must have admin rights),
+    # 这样即使拿不到日志也能定位; 注解每步上限 10 条、单条约 64KB, 只取尾部 5 行。
     - name: Compile node runtime
       run: |
         cd openwrt
+        # runner 实际用的是 `/usr/bin/bash -e {0}`(日志可查), 默认**没有** pipefail,
+        # 于是 `make | tee` 的 $? 是 tee 的 0, make 失败会被吞掉 —— 第七次运行就是这样:
+        # 本步报 Error 2 却仍继续执行, 一直到 Collect ipk 才以 "bin/packages 不存在" 失败。
+        set -o pipefail
         LOG=/tmp/node-build.log
-        echo "目标: $NODE_GOAL"
+        GOAL="$NODE_GOAL"
+        echo "目标: $GOAL"
         set +e
-        make "$NODE_GOAL" V=s -j$(nproc) 2>&1 | tee "$LOG"
+        make "$GOAL" V=s -j$(nproc) 2>&1 | tee "$LOG"
         rc=$?
+        # 主目标若未被 make 识别, 自动退到 include/subdir.mk 的目录别名目标再试一次
+        if [ $rc -ne 0 ] && grep -qF 'No rule to make target' "$LOG"; then
+          echo "::warning::主目标 $GOAL 未被识别, 改用目录别名目标 ${NODE_GOAL_ALT}"
+          GOAL="$NODE_GOAL_ALT"
+          make "$GOAL" V=s -j$(nproc) 2>&1 | tee "$LOG"
+          rc=$?
+        fi
         if [ $rc -ne 0 ]; then
           echo "::warning::并行编译失败(rc=$rc), 改用 -j1 重试以取得确定的错误位置"
-          make "$NODE_GOAL" V=s -j1 2>&1 | tee -a "$LOG"
+          make "$GOAL" V=s -j1 2>&1 | tee -a "$LOG"
           rc=$?
         fi
         set -e
         if [ $rc -ne 0 ]; then
-          echo "::error::node 编译失败 (rc=$rc), 目标 $NODE_GOAL"
+          echo "::error::node 编译失败 (rc=$rc), 目标 $GOAL"
           grep -nE 'No rule to make target|toplevel\.mk:[0-9]+|is missing|failed to build|Error [0-9]+|\*\*\*' "$LOG" \
             | tail -5 | while IFS= read -r line; do
                 echo "::error::${line:0:900}"
@@ -322,19 +427,27 @@ jobs:
     - name: Compile luci-app-unblockneteasemusic
       run: |
         cd openwrt
+        set -o pipefail
         LOG=/tmp/unm-build.log
-        echo "目标: $UNM_GOAL"
+        GOAL="$UNM_GOAL"
+        echo "目标: $GOAL"
         set +e
-        make "$UNM_GOAL" V=s -j$(nproc) 2>&1 | tee "$LOG"
+        make "$GOAL" V=s -j$(nproc) 2>&1 | tee "$LOG"
         rc=$?
+        if [ $rc -ne 0 ] && grep -qF 'No rule to make target' "$LOG"; then
+          echo "::warning::主目标 $GOAL 未被识别, 改用目录别名目标 ${UNM_GOAL_ALT}"
+          GOAL="$UNM_GOAL_ALT"
+          make "$GOAL" V=s -j$(nproc) 2>&1 | tee "$LOG"
+          rc=$?
+        fi
         if [ $rc -ne 0 ]; then
           echo "::warning::并行编译失败(rc=$rc), 改用 -j1 重试"
-          make "$UNM_GOAL" V=s -j1 2>&1 | tee -a "$LOG"
+          make "$GOAL" V=s -j1 2>&1 | tee -a "$LOG"
           rc=$?
         fi
         set -e
         if [ $rc -ne 0 ]; then
-          echo "::error::${UNM_PKG} 编译失败 (rc=$rc), 目标 $UNM_GOAL"
+          echo "::error::${UNM_PKG} 编译失败 (rc=$rc), 目标 $GOAL"
           grep -nE 'No rule to make target|toplevel\.mk:[0-9]+|is missing|failed to build|Error [0-9]+|\*\*\*' "$LOG" \
             | tail -5 | while IFS= read -r line; do
                 echo "::error::${line:0:900}"
@@ -345,7 +458,22 @@ jobs:
     - name: Collect ipk and inspect control data
       run: |
         cd openwrt
+        if [ ! -d bin/packages ]; then
+          echo "::error::bin/packages 不存在, 说明前面的编译步骤没有产出任何 ipk"
+          echo "--- bin/ 下的实际内容 ---"
+          ls -la bin 2>/dev/null || echo "(bin/ 也不存在)"
+          echo "--- 各包 stamp 状态 ---"
+          ls -la build_dir/target-*/stamp 2>/dev/null | head -20 || echo "(无 stamp 目录)"
+          exit 1
+        fi
         mkdir -p out
+        found=$(find bin/packages -name '*.ipk' | wc -l)
+        echo "找到 ipk: ${found} 个"
+        if [ "$found" -eq 0 ]; then
+          echo "::error::bin/packages 下没有任何 .ipk"
+          find bin/packages -maxdepth 4 -type d | head -20
+          exit 1
+        fi
         find bin/packages -name '*.ipk' -exec cp -f {} out/ \;
         cd out
         ls -lh
