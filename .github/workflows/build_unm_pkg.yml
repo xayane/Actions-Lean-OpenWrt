@@ -28,7 +28,7 @@ env:
   UNM_PKG: luci-app-unblockneteasemusic
   TZ: Asia/Shanghai
   CCACHE_DIR_WORKSPACE: ${{ github.workspace }}/.ccache
-  CCACHE_MAXSIZE: 40G
+  CCACHE_MAXSIZE: 5G
 
 permissions:
   contents: read
