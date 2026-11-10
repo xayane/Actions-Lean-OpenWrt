@@ -32,6 +32,10 @@ env:
   UPLOAD_FIRMWARE: true
   UPLOAD_RELEASE: true
   TZ: Asia/Shanghai
+  REQUIRED_PKGS: easytier-next luci-app-easytier-next luci-app-zerotier luci-app-ssr-plus
+  CCACHE_DIR_WORKSPACE: ${{ github.workspace }}/.ccache
+  # 单个仓库的 Actions 缓存上限是 10GB, 这里给 ccache 留 2GB(ccache 4.x 默认 zstd 压缩)。
+  CCACHE_MAXSIZE: 10G
 
 # 最小权限: 只读仓库即可编译, 发布 release 需要 contents: write
 permissions:
@@ -203,7 +207,92 @@ jobs:
             echo "::warning::运行时依赖 CONFIG_PACKAGE_${sym} 未选中, 插件可能无法启动"
           fi
         done
+        #---------------------------------------------------------------
+        # 配置符号存活检查(2026-11-10 新增, 针对"easytier 设了却没编进去")
+        #
+        # kconfig 对不存在的符号是完全静默的: 手写配置里写
+        # CONFIG_PACKAGE_luci-app-easytier=y, 但没有任何 feed 提供该包时,
+        # make defconfig 只把这行删掉, 编译照常 success, 固件里就是没有。
+        # 本次 easytier 缺失就是这个原因(lean luci feed 只有 luci-app-easytier-next)。
+        #
+        # 做法: 拿 requested.config 里每个 CONFIG_PACKAGE_*=y 去 .config 里找;
+        #   找不到 → 再查包元数据
+        #     · 符号在元数据里也不存在 = 没有任何 feed 提供 → ERROR(包名写错)
+        #     · 符号存在但没被选中     = 依赖不满足被牵连 → WARNING
+        # 用 awk 做整行/前缀比较, 避免包名里的 . + 被 grep -E 当正则解释。
+        #---------------------------------------------------------------
+        REQ=$GITHUB_WORKSPACE/requested.config
+        if [ ! -f "$REQ" ]; then
+          echo "::warning::找不到 requested.config, 跳过配置符号存活检查"
+        else
+          echo "----- 配置符号存活检查 -----"
+          dropped=0
+          missingreq=0
+          for line in $(grep -E '^CONFIG_PACKAGE_[A-Za-z0-9_.+-]+=y$' "$REQ" | sort -u); do
+            sym=${line#CONFIG_PACKAGE_}
+            sym=${sym%=y}
+            if awk -v s="CONFIG_PACKAGE_${sym}=" 'index($0,s)==1 && (/=y$/ || /=m$/){f=1} END{exit !f}' .config; then
+              continue
+            fi
+            dropped=$((dropped+1))
+            # 原因分类: 元数据里查不到 = 没有任何 feed 提供; 查得到但没选中 = 依赖不满足
+            reason="依赖不满足, 被牵连关闭"
+            if [ -f tmp/.config-package.in ] || [ -f tmp/.packageinfo ]; then
+              if { [ -f tmp/.config-package.in ] \
+                     && awk -v s="config PACKAGE_${sym}" '$0==s{f=1} END{exit !f}' tmp/.config-package.in; } \
+                 || { [ -f tmp/.packageinfo ] && grep -qxF "Package: ${sym}" tmp/.packageinfo; }; then
+                :
+              else
+                reason="不在任何 feed 中, 包名很可能写错"
+              fi
+            else
+              reason="缺少包元数据(tmp/.config-package.in 与 tmp/.packageinfo 都不存在), 无法判定"
+            fi
+            # 只有 REQUIRED_PKGS 里点名的才硬失败, 其余只告警:
+            # 历史遗留的无效项不该挡住一次一小时的编译, 但必须留下可见的注解。
+            case " ${REQUIRED_PKGS} " in
+              *" ${sym} "*)
+                echo "::error::必需包 CONFIG_PACKAGE_${sym} 没进入 .config —— ${reason}"
+                missingreq=$((missingreq+1)) ;;
+              *)
+                echo "::warning::CONFIG_PACKAGE_${sym} 未生效 —— ${reason}" ;;
+            esac
+          done
+          echo "未生效符号: ${dropped} 个; REQUIRED_PKGS 中缺失: ${missingreq} 个"
+          if [ "$missingreq" -gt 0 ]; then
+            echo "::error::配置点名的必需包没有生效, 固件不会包含它们; 先改配置再编译, 不要白跑一小时"
+            exit 1
+          fi
+        fi
         echo "OK: 固件不含 node, 不含 unblockneteasemusic"
+
+    - name: Compute ccache key
+      run: |
+        # requested.config 由 Load custom configuration 复制而来; 万一缺失也不能让本步失败,
+        # 退化为只对 workflow 文件求指纹(最坏情况只是缓存键不随配置变化)。
+        FILES=".github/workflows/x86_lean_GXT.yml"
+        [ -f "$GITHUB_WORKSPACE/requested.config" ] && FILES="$GITHUB_WORKSPACE/requested.config $FILES"
+        FINGERPRINT=$(sha256sum $FILES | sha256sum | cut -c1-12)
+        PREFIX="ccache-x64-gxt-${LEDE_COMMIT}"
+        {
+          echo "CCACHE_KEY_PREFIX=${PREFIX}"
+          echo "CCACHE_KEY=${PREFIX}-${FINGERPRINT}-${GITHUB_RUN_ID}"
+        } >> $GITHUB_ENV
+        echo "配置指纹  : ${FINGERPRINT}"
+        echo "ccache 键 : ${PREFIX}-${FINGERPRINT}-${GITHUB_RUN_ID}"
+
+    # 用 restore/save 两步而不是单个 actions/cache:
+    # 单步的保存动作是 post-if: success(), 编译失败就不落盘 —— 而"失败后重跑"正是
+    # 最需要缓存救命的场景(上次跑到第 50 分钟失败, 重跑不必再编一遍工具链和内核)。
+    - name: Restore ccache
+      uses: actions/cache/restore@v6
+      with:
+        path: ${{ env.CCACHE_DIR_WORKSPACE }}
+        key: ${{ env.CCACHE_KEY }}
+        restore-keys: |
+          ${{ env.CCACHE_KEY_PREFIX }}-
+          ccache-x64-gxt-
+          ccache-x64-
 
     - name: Download package
       id: package
@@ -222,15 +311,32 @@ jobs:
         # 不显式开启的话 `make | tee` 的退出码是 tee 的 0, 编译失败会被当成成功。
         set -o pipefail
         echo "使用 $(nproc) 线程编译"
+        # ccache 走命令行变量(原因见文件头 env 段的注释)。
+        # 变量必须跟着每一次 make 传, 因为 runner 的各个 run 步骤之间不共享 shell 变量。
+        CCACHE_OPTS="CONFIG_CCACHE=y CONFIG_CCACHE_DIR=$CCACHE_DIR_WORKSPACE"
+        mkdir -p "$CCACHE_DIR_WORKSPACE"
+        export LC_ALL=C
+        echo "ccache 目录: $CCACHE_DIR_WORKSPACE (上限 $CCACHE_MAXSIZE)"
+        ccache_val() { command -v ccache >/dev/null 2>&1 || return 0
+          ccache -s 2>/dev/null | grep -m1 "^$1" | sed -E 's/[^0-9]*([0-9]+).*/\1/'; }
+        echo "编译前: ccache 可缓存调用 $(ccache_val 'Cacheable calls') 次, 命中 $(ccache_val 'Hits') 次"
         # tee 出一份完整日志, 失败时用于定位
-        if ! make -j"$(nproc)" 2>&1 | tee build.log; then
+        if ! make -j"$(nproc)" $CCACHE_OPTS 2>&1 | tee build.log; then
           echo "::warning::并行编译失败, 用 -j1 V=s 重试一次以获取确定的错误位置"
-          if ! make -j1 V=s 2>&1 | tee -a build.log; then
+          if ! make -j1 V=s $CCACHE_OPTS 2>&1 | tee -a build.log; then
             echo "::error::编译失败, 详见 artifact 中的 build.log"
             exit 1
           fi
         fi
         echo "status=success" >> $GITHUB_OUTPUT
+        # 用 OpenWrt 自编的 ccache(4.10.2, 在 staging_dir/host/bin)读统计, 与编译时用的是同一个二进制
+        CCACHE_BIN=staging_dir/host/bin/ccache
+        if [ -x "$CCACHE_BIN" ]; then
+          echo "----- ccache 统计 -----"
+          "$CCACHE_BIN" -s 2>/dev/null | sed -n '1,16p' || true
+        else
+          echo "::warning::staging_dir/host/bin/ccache 不存在, ccache 可能没有真正启用"
+        fi
         echo "----- 产物清单 -----"
         ls -lh bin/targets/*/*/ 2>/dev/null || true
         # x86 Generic 没有 DEVICE_* 项, 该 grep 无匹配是正常的, 不能让步骤失败
@@ -241,9 +347,74 @@ jobs:
         fi
         echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
 
+    - name: Verify firmware contains required packages
+      run: |
+        cd openwrt
+        mapfile -t MANIFESTS < <(ls bin/targets/*/*/*.manifest 2>/dev/null)
+        if [ "${#MANIFESTS[@]}" -eq 0 ]; then
+          echo "::error::找不到 bin/targets 下的 manifest, 无法核对固件内容"
+          ls -l bin/targets/*/*/ 2>/dev/null || true
+          exit 1
+        fi
+        echo "核对 manifest: ${MANIFESTS[*]}"
+        miss=0
+        # 逐个 manifest × 逐个必需包核对: 每个镜像都必须各自包含, 不能"任一文件有就算有"
+        for m in "${MANIFESTS[@]}"; do
+          echo "--- ${m}"
+          for p in ${REQUIRED_PKGS}; do
+            # manifest 行格式为 "包名 - 版本"; awk 做整字段匹配避免前缀误判。
+            # 注意 kconfig 符号名 != manifest 包名: 带 ABI 版本后缀的库会变成
+            # libstdcpp->libstdcpp6 / libuv->libuv1, 所以要额外接受 "<名><数字>" 这种形式。
+            hit=$(awk -v n="$p" '
+              $2!="-"{next}
+              $1==n {print $1" "$3; exit}
+              $1 ~ ("^" n "[0-9]+$") {print $1" "$3; exit}
+            ' "$m")
+            if [ -n "$hit" ]; then
+              echo "  有  ${p} -> ${hit}"
+            else
+              echo "::error::${m} 里没有 ${p} —— 配置里选了但没编进镜像"
+              miss=$((miss+1))
+            fi
+          done
+        done
+        if [ "$miss" -gt 0 ]; then
+          echo "::error::共 ${miss} 处必需包缺失, 该镜像不可用"
+          exit 1
+        fi
+        echo "OK: ${#MANIFESTS[@]} 个 manifest 均含全部必需包"
+
     - name: Check space usage
       if: (!cancelled())
       run: df -hT
+
+    # 为 Save ccache 把关: 目录不存在时先建出来(否则 save 动作会报"path 不存在"),
+    # 同时量一下大小 —— 只有真正编过东西(>50MB)才值得占一个缓存配额。
+    - name: Inspect ccache
+      id: ccache-size
+      if: (!cancelled())
+      run: |
+        mkdir -p "$CCACHE_DIR_WORKSPACE"
+        SIZE=$(du -sm "$CCACHE_DIR_WORKSPACE" | cut -f1)
+        echo "ccache 目录大小: ${SIZE} MB"
+        # 只在真正编过东西(>50MB)时才值得占一个缓存配额; 用显式布尔输出,
+        # 不在 if 里做字符串/数字隐式比较。
+        if [ "${SIZE:-0}" -ge 50 ]; then WORTH=true; else WORTH=false; fi
+        echo "worth=${WORTH}" >> $GITHUB_OUTPUT
+        echo "是否保存缓存: ${WORTH} (阈值 50MB)"
+        CCACHE_BIN=openwrt/staging_dir/host/bin/ccache
+        if [ -x "$CCACHE_BIN" ]; then
+          echo "----- ccache 最终统计 -----"
+          "$CCACHE_BIN" -s 2>/dev/null | sed -n '1,16p' || true
+        fi
+
+    # if: always() 是关键: 编译失败时也要把已生成的缓存存下来, 否则下次重跑仍从零开始。
+    - name: Save ccache
+      if: always() && !cancelled() && steps.ccache-size.outputs.worth == 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: ${{ env.CCACHE_DIR_WORKSPACE }}
+        key: ${{ env.CCACHE_KEY }}
 
     # 失败时把关键信息直接打到日志里, 不必下载 artifact 就能判断原因
     - name: Report build failure
@@ -331,8 +502,6 @@ jobs:
           | tail -n +3 \
           | while read -r id; do gh run delete "$id" || true; done
 
-    # 只清理 GXT- 前缀的 release, 避免把 MJ 那台的 release 一并删掉
-    # 必须挂在 tag 成功之后: 否则编译失败时也会跑, 白白删掉历史 release
     - name: Remove old GXT releases
       if: steps.tag.outputs.status == 'success'
       env:
@@ -343,3 +512,4 @@ jobs:
           | while read -r tag; do
               [ -n "$tag" ] && gh release delete "$tag" --yes --cleanup-tag
             done
+
