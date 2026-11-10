@@ -27,6 +27,8 @@ env:
   CONFIG_FILE: unm/unm.config
   UNM_PKG: luci-app-unblockneteasemusic
   TZ: Asia/Shanghai
+  CCACHE_DIR_WORKSPACE: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 40G
 
 permissions:
   contents: read
@@ -88,7 +90,6 @@ jobs:
         large-packages: true
         swap-storage: true
 
-
     - name: Install build dependencies
       env:
         DEBIAN_FRONTEND: noninteractive
@@ -117,18 +118,16 @@ jobs:
         fi
         [ -n "$NCURSESW" ] && echo "ncursesw 头文件包: $NCURSESW (可缺省)"
 
-        # 编 node 与本插件离不开的包。任何一个缺失都直接失败 —— 缺了必然编不过,
-        # 第 30 秒报错远好过第 40 分钟才报。
         MUST="build-essential gcc-multilib g++-multilib autoconf automake libtool
               binutils bison flex gawk gettext pkgconf cmake ninja-build patch cpio
               rsync wget curl git unzip bzip2 xz-utils zlib1g-dev libssl-dev
               libelf-dev libltdl-dev libmpc-dev libmpfr-dev libgmp3-dev libreadline-dev
               libpython3-dev python3 python3-setuptools python3-pyelftools texinfo
               subversion swig squashfs-tools scons device-tree-compiler qemu-utils
-              upx-ucl libglib2.0-dev libfuse-dev"
+              upx-ucl libglib2.0-dev libfuse-dev ccache"
 
         # 只在完整固件编译或个别插件里用到, 缺了不影响 node/UNM, 降级为告警。
-        OPT="ack antlr3 asciidoc autopoint ccache clang llvm genisoimage gperf haveged help2man
+        OPT="ack antlr3 asciidoc autopoint clang llvm genisoimage gperf haveged help2man
              intltool libc6-dev-i386 lrzsz msmtp p7zip p7zip-full uglifyjs vim xmlto xxd"
 
         must_list=""; must_missing=""
@@ -165,8 +164,6 @@ jobs:
           echo "::warning::以下可选依赖在本镜像不可用(不影响 node/UNM 编译):${opt_missing}"
         fi
 
-        # python3.12 起 distutils 从标准库移除, 旧版 LEDE 脚本仍可能 import distutils。
-        # 有独立包就装; 没有就看 setuptools 是否兜住; 两样都没有才告警。
         if has_pkg python3-distutils; then
           sudo -E apt-get -y install python3-distutils >/dev/null 2>&1 && echo "已装 python3-distutils"
         elif python3 -c 'import setuptools' >/dev/null 2>&1; then
@@ -178,7 +175,7 @@ jobs:
         sudo timedatectl set-timezone "$TZ" || echo "::warning::设置时区失败(容器环境常见), 不影响构建"
 
         echo "########## 关键工具版本 ##########"
-        for c in gcc g++ make python3 perl rsync; do
+        for c in gcc g++ make ccache python3 perl rsync; do
           printf '%-8s %s\n' "$c" "$(command -v $c >/dev/null 2>&1 && $c --version 2>&1 | head -1 || echo 缺失)"
         done
         df -hT /
@@ -282,15 +279,41 @@ jobs:
           openwrt/build_dir/toolchain-*
         key: unm-host-${{ env.LEDE_COMMIT }}-${{ hashFiles('unm/unm.config') }}
 
+    # ccache 键: 精确 key 带 run_id(缓存条目不可覆盖, 固定 key 会让第二次之后不再写入新内容),
+    # restore-keys 逐级放宽到同分支任意 commit —— ccache 条目内容寻址, 跨 commit 复用安全。
+    # 指纹用 unm/unm.config(本 workflow 的意图配置)与自身 workflow 文件。
+    - name: Compute ccache key
+      run: |
+        FINGERPRINT=$(sha256sum "$CONFIG_FILE" .github/workflows/build_unm_pkg.yml \
+          | sha256sum | cut -c1-12)
+        PREFIX="ccache-unm-${LEDE_COMMIT}"
+        {
+          echo "CCACHE_KEY_PREFIX=${PREFIX}"
+          echo "CCACHE_KEY=${PREFIX}-${FINGERPRINT}-${GITHUB_RUN_ID}"
+        } >> $GITHUB_ENV
+        echo "配置指纹  : ${FINGERPRINT}"
+        echo "ccache 键 : ${PREFIX}-${FINGERPRINT}-${GITHUB_RUN_ID}"
+
+    - name: Restore ccache
+      id: ccache
+      uses: actions/cache/restore@v6
+      with:
+        path: ${{ env.CCACHE_DIR_WORKSPACE }}
+        key: ${{ env.CCACHE_KEY }}
+        restore-keys: |
+          ${{ env.CCACHE_KEY_PREFIX }}-
+          ccache-unm-
+
     - name: Report cache status
       run: |
         echo "dl 缓存命中        : ${{ steps.dl-cache.outputs.cache-hit }}"
         echo "宿主工具链缓存命中 : ${{ steps.host-cache.outputs.cache-hit }}"
-        for d in openwrt/dl openwrt/staging_dir openwrt/build_dir; do
+        echo "ccache 缓存命中    : ${{ steps.ccache.outputs.cache-hit }}"
+        for d in openwrt/dl openwrt/staging_dir openwrt/build_dir "$CCACHE_DIR_WORKSPACE"; do
           if [ -d "$d" ]; then
-            printf '%-20s %s\n' "$d" "$(du -sh "$d" | cut -f1)"
+            printf '%-40s %s\n' "$d" "$(du -sh "$d" | cut -f1)"
           else
-            printf '%-20s %s\n' "$d" "空"
+            printf '%-40s %s\n' "$d" "空"
           fi
         done
         # 标准 runner 只有 14 GB 磁盘, 缓存 + 编译产物很容易吃满。
@@ -499,16 +522,21 @@ jobs:
     - name: Build tools and toolchain
       run: |
         cd openwrt
-        make tools/install -j$(nproc) || make tools/install -j1
-        make toolchain/install -j$(nproc) || make toolchain/install -j1
+        # ccache: 命令行变量, 见 env 段注释。第一次会先编 tools/ccache(4.10.2) 再编其余工具。
+        CCACHE_OPTS="CONFIG_CCACHE=y CONFIG_CCACHE_DIR=$CCACHE_DIR_WORKSPACE"
+        mkdir -p "$CCACHE_DIR_WORKSPACE"
+        echo "ccache 目录: $CCACHE_DIR_WORKSPACE (上限 $CCACHE_MAXSIZE)"
+        make tools/install -j$(nproc) $CCACHE_OPTS || make tools/install -j1 $CCACHE_OPTS
+        make toolchain/install -j$(nproc) $CCACHE_OPTS || make toolchain/install -j1 $CCACHE_OPTS
 
     - name: Build kernel for target
       run: |
         cd openwrt
         echo "开始编译内核(为 kmod 打包提供 .ko), 预计 20-30 分钟"
         START=$(date +%s)
-        make target/linux/compile -j$(nproc) V=s > /tmp/kernel-build.log 2>&1 \
-          || make target/linux/compile -j1 V=s >> /tmp/kernel-build.log 2>&1 \
+        CCACHE_OPTS="CONFIG_CCACHE=y CONFIG_CCACHE_DIR=$CCACHE_DIR_WORKSPACE"
+        make target/linux/compile -j$(nproc) V=s $CCACHE_OPTS > /tmp/kernel-build.log 2>&1 \
+          || make target/linux/compile -j1 V=s $CCACHE_OPTS >> /tmp/kernel-build.log 2>&1 \
           || {
             echo "::error::内核编译失败, 尾部错误行:"
             grep -nE 'Error [0-9]+|\*\*\*|error:' /tmp/kernel-build.log | tail -5 \
@@ -536,20 +564,21 @@ jobs:
         set -o pipefail
         LOG=/tmp/node-build.log
         GOAL="$NODE_GOAL"
+        CCACHE_OPTS="CONFIG_CCACHE=y CONFIG_CCACHE_DIR=$CCACHE_DIR_WORKSPACE"
         echo "目标: $GOAL"
         set +e
-        make "$GOAL" V=s -j$(nproc) 2>&1 | tee "$LOG"
+        make "$GOAL" V=s -j$(nproc) $CCACHE_OPTS 2>&1 | tee "$LOG"
         rc=$?
         # 主目标若未被 make 识别, 自动退到 include/subdir.mk 的目录别名目标再试一次
         if [ $rc -ne 0 ] && grep -qF 'No rule to make target' "$LOG"; then
           echo "::warning::主目标 $GOAL 未被识别, 改用目录别名目标 ${NODE_GOAL_ALT}"
           GOAL="$NODE_GOAL_ALT"
-          make "$GOAL" V=s -j$(nproc) 2>&1 | tee "$LOG"
+          make "$GOAL" V=s -j$(nproc) $CCACHE_OPTS 2>&1 | tee "$LOG"
           rc=$?
         fi
         if [ $rc -ne 0 ]; then
           echo "::warning::并行编译失败(rc=$rc), 改用 -j1 重试以取得确定的错误位置"
-          make "$GOAL" V=s -j1 2>&1 | tee -a "$LOG"
+          make "$GOAL" V=s -j1 $CCACHE_OPTS 2>&1 | tee -a "$LOG"
           rc=$?
         fi
         set -e
@@ -568,19 +597,20 @@ jobs:
         set -o pipefail
         LOG=/tmp/unm-build.log
         GOAL="$UNM_GOAL"
+        CCACHE_OPTS="CONFIG_CCACHE=y CONFIG_CCACHE_DIR=$CCACHE_DIR_WORKSPACE"
         echo "目标: $GOAL"
         set +e
-        make "$GOAL" V=s -j$(nproc) 2>&1 | tee "$LOG"
+        make "$GOAL" V=s -j$(nproc) $CCACHE_OPTS 2>&1 | tee "$LOG"
         rc=$?
         if [ $rc -ne 0 ] && grep -qF 'No rule to make target' "$LOG"; then
           echo "::warning::主目标 $GOAL 未被识别, 改用目录别名目标 ${UNM_GOAL_ALT}"
           GOAL="$UNM_GOAL_ALT"
-          make "$GOAL" V=s -j$(nproc) 2>&1 | tee "$LOG"
+          make "$GOAL" V=s -j$(nproc) $CCACHE_OPTS 2>&1 | tee "$LOG"
           rc=$?
         fi
         if [ $rc -ne 0 ]; then
           echo "::warning::并行编译失败(rc=$rc), 改用 -j1 重试"
-          make "$GOAL" V=s -j1 2>&1 | tee -a "$LOG"
+          make "$GOAL" V=s -j1 $CCACHE_OPTS 2>&1 | tee -a "$LOG"
           rc=$?
         fi
         set -e
@@ -592,6 +622,36 @@ jobs:
               done
           exit 1
         fi
+
+    # ccache 的成败要看命中的绝对值, 所以把统计直接打到日志里, 不依赖本地复现。
+    - name: Inspect ccache
+      id: ccache-size
+      if: always() && !cancelled()
+      run: |
+        mkdir -p "$CCACHE_DIR_WORKSPACE"
+        SIZE=$(du -sm "$CCACHE_DIR_WORKSPACE" | cut -f1)
+        echo "ccache 目录大小: ${SIZE} MB"
+        # 只在真正编过东西(>50MB)时才值得占一个缓存配额; 用显式布尔输出,
+        # 不在 if 里做字符串/数字隐式比较。
+        if [ "${SIZE:-0}" -ge 50 ]; then WORTH=true; else WORTH=false; fi
+        echo "worth=${WORTH}" >> $GITHUB_OUTPUT
+        echo "是否保存缓存: ${WORTH} (阈值 50MB)"
+        CCACHE_BIN=openwrt/staging_dir/host/bin/ccache
+        if [ -x "$CCACHE_BIN" ]; then
+          echo "----- ccache 统计 -----"
+          LC_ALL=C "$CCACHE_BIN" -s 2>/dev/null | sed -n '1,20p' || true
+        else
+          echo "::warning::staging_dir/host/bin/ccache 不存在, ccache 可能没有真正启用"
+        fi
+
+    # if: always() 是关键: 本 workflow 历史上多次在中途失败, 失败时也存缓存,
+    # 下次重跑才能跳过已编过的工具链/内核。
+    - name: Save ccache
+      if: always() && !cancelled() && steps.ccache-size.outputs.worth == 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: ${{ env.CCACHE_DIR_WORKSPACE }}
+        key: ${{ env.CCACHE_KEY }}
 
     - name: Collect ipk and inspect control data
       run: |
@@ -658,3 +718,4 @@ jobs:
           echo ""
           echo "安装: 把 artifact 内全部 ipk 上传到路由器 /tmp/unm-ipk, 执行 tools/install-unm-on-router.sh"
         } >> $GITHUB_STEP_SUMMARY
+
