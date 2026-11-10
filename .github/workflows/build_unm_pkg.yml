@@ -28,7 +28,8 @@ env:
   UNM_PKG: luci-app-unblockneteasemusic
   TZ: Asia/Shanghai
   CCACHE_DIR_WORKSPACE: ${{ github.workspace }}/.ccache
-  CCACHE_MAXSIZE: 5G
+  CCACHE_MAXSIZE: 3G
+  CCACHE_GEN: v1
 
 permissions:
   contents: read
@@ -244,20 +245,6 @@ jobs:
         echo "SHORT_COMMIT=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
         git log -1 --format='LEDE commit: %H%n提交日期: %ci%n标题: %s'
 
-    # ── 构建缓存 ────────────────────────────────────────────────────────────
-    # 两段缓存的取舍不同, 分开设计是为了控制"复用旧产物导致结果错误"的风险:
-    #
-    # 1) dl/ —— LEDE 下载的源码包。每个 tarball 都带哈希校验, 复用不影响正确性,
-    #    所以用 restore-keys 前缀命中: 即使换了 commit, 也能吃到已下载的那部分,
-    #    省掉 1-2 GB 的网络下载。
-    # 2) 宿主工具链(host 工具 + 交叉工具链) —— 与 commit 强绑定(gcc/binutils 版本
-    #    由 commit 决定), 因此**只设精确 key、不设 restore-keys**, 绝不复用别的 commit
-    #    的产物。它只在"同一 commit 重跑"时命中, 而这恰好是最需要救的场景:
-    #    上次跑到第 60 分钟失败, 重跑时不必再花 20-40 分钟重编工具链。
-    #    必须 staging_dir 与 build_dir 成对缓存: make 判断"是否已编译"看的是
-    #    build_dir 里的 stamp, 只恢复 staging_dir 的话它照样从头再编一遍, 等于没缓存。
-    #    目标侧(target-*)不缓存: 它与 .config 的包选择耦合, 恢复半套会造出不一致的构建树。
-    #    actions/cache 的保存动作是 post-if: success(), 失败运行不会写入缓存。
     - name: Restore source package cache (dl)
       id: dl-cache
       uses: actions/cache@v6
@@ -289,10 +276,11 @@ jobs:
         PREFIX="ccache-unm-${LEDE_COMMIT}"
         {
           echo "CCACHE_KEY_PREFIX=${PREFIX}"
-          echo "CCACHE_KEY=${PREFIX}-${FINGERPRINT}-${GITHUB_RUN_ID}"
+          echo "CCACHE_KEY=${PREFIX}-${FINGERPRINT}-${CCACHE_GEN}"
         } >> $GITHUB_ENV
         echo "配置指纹  : ${FINGERPRINT}"
-        echo "ccache 键 : ${PREFIX}-${FINGERPRINT}-${GITHUB_RUN_ID}"
+        echo "缓存代次  : ${CCACHE_GEN}"
+        echo "ccache 键 : ${PREFIX}-${FINGERPRINT}-${CCACHE_GEN}"
 
     - name: Restore ccache
       id: ccache
