@@ -41,11 +41,6 @@ env:
 permissions:
   contents: write
 
-# 同一分支只跑一个, 避免定时任务与手工触发抢 runner、互相覆盖 release 标签
-concurrency:
-  group: mj-firmware-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
   check:
     name: Check for source code updates
