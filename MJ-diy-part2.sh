@@ -13,10 +13,9 @@
 rm -rf package/feeds/luci/luci-theme-argon
 rm -rf package/feeds/luci/luci-app-argon-config
 rm -rf package/feeds/luci/luci-theme-infinityfreedom
-rm -rf package/feeds/luci/luci-theme-design
+#rm -rf package/feeds/luci/luci-theme-design
 #rm -rf package/feeds/luci/luci-app-unblockneteasemusic
 git clone https://github.com/xiaoqingfengATGH/luci-theme-infinityfreedom.git package/feeds/luci/luci-theme-infinityfreedom
-git clone https://github.com/SAENE/luci-theme-design.git package/feeds/luci/luci-theme-design
 git clone -b master https://github.com/jerrykuku/luci-theme-argon.git package/feeds/luci/luci-theme-argon
 git clone -b master https://github.com/jerrykuku/luci-app-argon-config.git package/feeds/luci/luci-app-argon-config
 git clone https://github.com/derisamedia/luci-theme-alpha package/feeds/luci/luci-theme-alpha
