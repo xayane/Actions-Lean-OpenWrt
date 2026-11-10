@@ -35,7 +35,8 @@ env:
   REQUIRED_PKGS: easytier-next luci-app-easytier-next luci-app-zerotier luci-app-ssr-plus
   CCACHE_DIR_WORKSPACE: ${{ github.workspace }}/.ccache
   # 单个仓库的 Actions 缓存上限是 10GB, 这里给 ccache 留 2GB(ccache 4.x 默认 zstd 压缩)。
-  CCACHE_MAXSIZE: 2G
+  CCACHE_MAXSIZE: 3G
+  CCACHE_GEN: v1
 
 # 最小权限: 只读仓库即可编译, 发布 release 需要 contents: write
 permissions:
@@ -271,10 +272,11 @@ jobs:
         PREFIX="ccache-x64-gxt-${LEDE_COMMIT}"
         {
           echo "CCACHE_KEY_PREFIX=${PREFIX}"
-          echo "CCACHE_KEY=${PREFIX}-${FINGERPRINT}-${GITHUB_RUN_ID}"
+          echo "CCACHE_KEY=${PREFIX}-${FINGERPRINT}-${CCACHE_GEN}"
         } >> $GITHUB_ENV
         echo "配置指纹  : ${FINGERPRINT}"
-        echo "ccache 键 : ${PREFIX}-${FINGERPRINT}-${GITHUB_RUN_ID}"
+        echo "缓存代次  : ${CCACHE_GEN}"
+        echo "ccache 键 : ${PREFIX}-${FINGERPRINT}-${CCACHE_GEN}"
 
     # 用 restore/save 两步而不是单个 actions/cache:
     # 单步的保存动作是 post-if: success(), 编译失败就不落盘 —— 而"失败后重跑"正是
