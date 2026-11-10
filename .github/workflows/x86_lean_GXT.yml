@@ -35,7 +35,7 @@ env:
   REQUIRED_PKGS: easytier-next luci-app-easytier-next luci-app-zerotier luci-app-ssr-plus
   CCACHE_DIR_WORKSPACE: ${{ github.workspace }}/.ccache
   # 单个仓库的 Actions 缓存上限是 10GB, 这里给 ccache 留 2GB(ccache 4.x 默认 zstd 压缩)。
-  CCACHE_MAXSIZE: 10G
+  CCACHE_MAXSIZE: 2G
 
 # 最小权限: 只读仓库即可编译, 发布 release 需要 contents: write
 permissions:
