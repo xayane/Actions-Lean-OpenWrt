@@ -41,13 +41,6 @@
 ERRORS=0
 FEED_LUCI=package/feeds/luci
 
-# fetch_pkg <仓库地址> <目标目录> [分支...]
-#
-# 旧写法是 `rm -rf 目录; git clone ...`:
-#   一旦 clone 失败(仓库改名/删除/分支不存在), 被删掉的 feed 自带包再也补不回来,
-#   而脚本仍会继续往下跑 —— 结果编到 package/install 阶段才炸, 白费一整轮构建。
-# 新做法: 先 clone 到临时目录, 成功才替换目标目录;
-#   失败时若 feed 里本来就有这个包, 保留 feed 版本并告警, 不破坏可编译状态。
 fetch_pkg() {
   local url="$1" dest="$2"
   shift 2
@@ -87,11 +80,6 @@ fetch_pkg() {
 }
 
 # ---- 主题 ----
-# luci-theme-design: 不再 rm, 也不再从 SAENE/luci-theme-design 克隆 —— 该仓库已 404
-# (git 报 "could not read Username for 'https://github.com'", 实质就是仓库不存在)。
-# LEDE luci feed(openwrt-25.12) 自带 themes/luci-theme-design(PKG_VERSION 7.1),
-# 而 feed 的 luci-app-design-config 声明了 LUCI_DEPENDS:=+luci-theme-design;
-# 之前"先删 feed 版本、再用坏地址克隆"直接让该依赖无法满足, 镜像组装阶段必失败。
 fetch_pkg https://github.com/xiaoqingfengATGH/luci-theme-infinityfreedom.git \
   "$FEED_LUCI/luci-theme-infinityfreedom"
 fetch_pkg https://github.com/jerrykuku/luci-theme-argon.git \
@@ -102,10 +90,8 @@ fetch_pkg https://github.com/derisamedia/luci-theme-alpha \
   "$FEED_LUCI/luci-theme-alpha" master
 fetch_pkg https://github.com/derisamedia/luci-app-alpha-config \
   "$FEED_LUCI/luci-app-alpha-config" master
-# kucat: 原来写死 `-b js`, 本轮构建报 "Remote branch js not found";
-# 改为按 js -> master -> 默认分支 依次尝试。
 fetch_pkg https://github.com/sirpdboy/luci-theme-kucat \
-  "$FEED_LUCI/luci-theme-kucat" js master
+  "$FEED_LUCI/luci-theme-kucat" master
 fetch_pkg https://github.com/sirpdboy/luci-app-kucat-config \
   "$FEED_LUCI/luci-app-kucat-config" master
 
