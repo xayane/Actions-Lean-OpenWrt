@@ -1,22 +1,18 @@
-#=================================================
-# https://github.com/Lancenas/Actions-Lean-OpenWrt
-# Description: Build OpenWrt using GitHub Actions
-# Lisence: MIT
-# Author: P3TERX
-# Blog: https://P3TERX.com
-#=================================================
+# 固件 GXT · x86_64 lean, 不含 luci-app-unblockneteasemusic 与 node
+# 插件由 build_unm_pkg.yml 单独出 ipk, 必须用同一 LEDE commit 构建
+# 结构须与 x86_lean_MJ.yml 完全一致(仅变量不同), 由 tools/check-workflows.py 校验
+# 变更记录见 CHANGELOG.md
 
-name: Build x64 lean for GXT R2Max
+name: Build x64 lean for GXT (no UNM)
 
 on:
   repository_dispatch:
   workflow_dispatch:
     inputs:
       force-build:
-        description: "Build x64 lean for GXT R2Max"
+        description: "Build x64 lean for GXT without unblockneteasemusic"
         required: false
         default: "false"
-  # Uncomment the following to run regularly. Note that the cron expression here does not contain seconds.
   schedule:
     - cron: '30 1 * * *'
 
@@ -32,20 +28,23 @@ env:
   UPLOAD_FIRMWARE: true
   UPLOAD_RELEASE: true
   TZ: Asia/Shanghai
-  REQUIRED_PKGS: easytier-next luci-app-easytier-next luci-app-zerotier luci-app-ssr-plus
+  # defconfig 后必须仍在 .config 里的包(缺失即失败), 只列真要的
+  REQUIRED_PKGS: easytier-next luci-app-easytier-next luci-theme-argon luci-app-argon-config luci-theme-design luci-app-design-config luci-theme-kucat luci-app-kucat-config luci-theme-alpha luci-app-alpha-config luci-app-zerotier luci-app-ssr-plus dnsmasq-full firewall4 ucode
   CCACHE_DIR_WORKSPACE: ${{ github.workspace }}/.ccache
-  # 单个仓库的 Actions 缓存上限是 10GB, 这里给 ccache 留 2GB(ccache 4.x 默认 zstd 压缩)。
   CCACHE_MAXSIZE: 3G
   CCACHE_GEN: v1
 
-# 最小权限: 只读仓库即可编译, 发布 release 需要 contents: write
 permissions:
   contents: write
+
+concurrency:
+  group: gxt-firmware-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   check:
     name: Check for source code updates
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       cache-hit: ${{ steps.cache-hash.outputs.cache-hit }}
 
@@ -58,7 +57,7 @@ jobs:
 
       - name: Compare Commit Hash
         id: cache-hash
-        uses: actions/cache@main
+        uses: actions/cache@v6
         with:
           path: .${{ env.REPO_NAME }}-${{ env.REPO_BRANCH }}-commit-hash
           key: HEAD-${{ steps.get-hash.outputs.commit-hash }}
@@ -66,70 +65,79 @@ jobs:
       - name: Save New Commit Hash
         if: steps.cache-hash.outputs.cache-hit != 'true'
         run: |
-          echo ${{ steps.get-hash.outputs.commit-hash }} | 
-            tee .$REPO_NAME-$REPO_BRANCH-commit-hash
+          echo ${{ steps.get-hash.outputs.commit-hash }} | tee .${{ env.REPO_NAME }}-${{ env.REPO_BRANCH }}-commit-hash
+
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    needs: check
+    if: needs.check.outputs.cache-hit != 'true' || github.event_name != 'schedule'
 
     steps:
-    - name: Check Server Performance
-      run: |
-        echo "警告⚠"
-        echo "分配的服务器性能有限，若选择的插件过多，务必注意CPU性能！"
-        echo -e "已知CPU型号（降序）：7763，8370C，8272CL，8171M，E5-2673 \n"
-        echo "--------------------------CPU信息--------------------------"
-        echo "CPU物理数量：$(cat /proc/cpuinfo | grep "physical id" | sort | uniq | wc -l)"
-        echo -e "CPU核心信息：$(cat /proc/cpuinfo | grep name | cut -f2 -d: | uniq -c) \n"
-        echo "--------------------------内存信息--------------------------"
-        echo "已安装内存详细信息："
-        echo -e "$(sudo lshw -short -C memory | grep GiB) \n"
-        echo "--------------------------硬盘信息--------------------------"
-        echo "硬盘数量：$(ls /dev/sd* | grep -v [1-9] | wc -l)" && df -hT
-          
     - name: Checkout
-      uses: actions/checkout@main
+      uses: actions/checkout@v7
 
-    - name: Free Disk Space (Ubuntu)
-      uses: jlumbroso/free-disk-space@main
-      with:
-        # this might remove tools that are actually needed,
-        # if set to "true" but frees about 6 GB
-        preinstalled-runtimes: true
-        docker-images: true
-        # all of these default to true, but feel free to set to
-        # "false" if necessary for your workflow
-        android: true
-        dotnet: true
-        haskell: true
-        large-packages: true
-        swap-storage: true
+    - name: Check runner environment
+      run: |
+        echo "分配的服务器性能有限，若选择的插件过多，务必注意CPU性能！"
+        lsb_release -a || cat /etc/os-release
+        echo "-------------------------- CPU --------------------------"
+        lscpu | grep -E '^(Architecture|CPU\(s\)|Model name|Thread|Core|Socket)' || true
+        echo "-------------------------- 内存 --------------------------"
+        free -h
+        echo "-------------------------- 磁盘 --------------------------"
+        df -hT /
 
+    # 不用第三方清理动作: 布尔输入缺失会崩, os_swap 留 /swapfile 报 EACCES
+    - name: Free disk space
+      run: |
+        set -x
+        sudo swapoff -a || true
+        sudo rm -f /swapfile || true
+        echo "=========== before ==========="; df -hT /
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                    /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                    /usr/share/swift /usr/lib/jvm /opt/az /usr/local/.ghcup || true
+        sudo rm -rf /usr/local/lib/node_modules || true
+        sudo docker image prune --all --force || true
+        sudo docker system prune --all --force || true
+        sudo apt-get clean || true
+        sudo rm -rf /var/lib/apt/lists/* || true
+        echo "=========== after ==========="; df -hT /
+
+    # 不动 apt 源: 24.04 上 /etc/apt/sources.list.d 是唯一源
     - name: Initialization environment
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
         sudo -E apt-get update
-        sudo -E apt-get -y install ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler flex gawk gcc-multilib g++-multilib gettext genisoimage git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libpython3-dev libreadline-dev libssl-dev libtool llvm lrzsz msmtp ninja-build p7zip p7zip-full patch pkgconf python3 python3-pyelftools python3-setuptools qemu-utils rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
+        sudo -E apt-get -y install ack antlr3 asciidoc autoconf automake autopoint binutils bison \
+          build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler flex gawk \
+          gcc-multilib g++-multilib gettext genisoimage git gperf haveged help2man intltool \
+          libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev \
+          libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libpython3-dev \
+          libreadline-dev libssl-dev libtool llvm lrzsz msmtp ninja-build p7zip p7zip-full \
+          patch pkgconf python3 python3-pyelftools python3-setuptools qemu-utils rsync \
+          scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget \
+          xmlto xxd zlib1g-dev
         sudo -E systemctl daemon-reload
         sudo apt-get -qq clean
         sudo timedatectl set-timezone "$TZ"
-        sudo mkdir -p /workdir
-        sudo chown "$USER:$GROUPS" /workdir
+        sudo mkdir -p "${{ github.workspace }}/workdir"
+        sudo chown "$USER:$GROUPS" "${{ github.workspace }}/workdir"
         echo "----- 依赖检查 -----"
         for b in gcc g++ make python3 rsync unzip; do printf '%-8s %s\n' "$b" "$(command -v $b || echo MISSING)"; done
         df -hT /
 
     - name: Clone source code
-      working-directory: /workdir
+      working-directory: ${{ github.workspace }}/workdir
       run: |
         df -hT $PWD
         git clone $REPO_URL -b $REPO_BRANCH openwrt
-        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+        ln -sf ${{ github.workspace }}/workdir/openwrt $GITHUB_WORKSPACE/openwrt
         echo "LEDE_COMMIT=$(git -C openwrt rev-parse HEAD)" >> $GITHUB_ENV
         echo "SHORT_COMMIT=$(git -C openwrt rev-parse --short HEAD)" >> $GITHUB_ENV
         git -C openwrt log -1 --format='LEDE commit: %H%n提交日期: %ci%n标题: %s'
 
-    # 把 commit 显式打到运行页, 免得下次构建插件时还要翻 release 正文去找
     - name: Record LEDE commit
       run: |
         {
@@ -165,16 +173,18 @@ jobs:
     - name: Load custom configuration
       run: |
         [ -e files ] && mv files openwrt/files
+        [ -e $CONFIG_FILE ] && cp $CONFIG_FILE $GITHUB_WORKSPACE/requested.config || true
         [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
         chmod +x $DIY_P2_SH
         cd openwrt
         $GITHUB_WORKSPACE/$DIY_P2_SH
 
-    # 新增: 断言 node / unblockneteasemusic 均未进入固件配置
+    # kconfig 静默丢弃不存在的符号, 得自己查
     - name: Verify node is excluded from firmware
       run: |
         cd openwrt
-        make defconfig
+        set -o pipefail
+        make defconfig 2>&1 | tee /tmp/defconfig.log
         echo "----- node / unblockneteasemusic 断言 -----"
         if grep -qE '^CONFIG_PACKAGE_(node|node-npm)=y' .config; then
           echo "::error::node 仍被选中, 说明还有包依赖它"
@@ -188,35 +198,16 @@ jobs:
         if ! grep -qE '^CONFIG_PACKAGE_dnsmasq-full=y' .config; then
           echo "::warning::dnsmasq-full 未被选中, 安装 UNM ipk 时会发生 dnsmasq 替换"
         fi
-        # 统一到 feed 版 v3.4: 插件目录必须保持 feeds 的符号链接形态,
-        # 若变成真实目录说明被 diy 脚本 clone 覆盖成了上游旧版(v2.15, ipset 分流)
         UNM_DIR=package/feeds/luci/luci-app-unblockneteasemusic
         if [ -d "$UNM_DIR" ] && [ ! -L "$UNM_DIR" ]; then
           echo "::error::${UNM_DIR} 是真实目录, 疑似被 clone 覆盖成上游旧版"
           exit 1
         fi
-        # 运行时依赖检查(缺任何一项, 插件 ipk 装上去也跑不起来)
-        # firewall4/nftables-json/ucode: v3.4 的 fw4+nftset 分流; ucode 提供 utpl 模板渲染器
-        # libstdcpp/libuv: node 的 C++ 运行时与事件循环库
         for sym in firewall4 nftables-json ucode libstdcpp libuv; do
           if ! grep -qE "^CONFIG_PACKAGE_${sym}=y" .config; then
             echo "::warning::运行时依赖 CONFIG_PACKAGE_${sym} 未选中, 插件可能无法启动"
           fi
         done
-        #---------------------------------------------------------------
-        # 配置符号存活检查(2026-11-10 新增, 针对"easytier 设了却没编进去")
-        #
-        # kconfig 对不存在的符号是完全静默的: 手写配置里写
-        # CONFIG_PACKAGE_luci-app-easytier=y, 但没有任何 feed 提供该包时,
-        # make defconfig 只把这行删掉, 编译照常 success, 固件里就是没有。
-        # 本次 easytier 缺失就是这个原因(lean luci feed 只有 luci-app-easytier-next)。
-        #
-        # 做法: 拿 requested.config 里每个 CONFIG_PACKAGE_*=y 去 .config 里找;
-        #   找不到 → 再查包元数据
-        #     · 符号在元数据里也不存在 = 没有任何 feed 提供 → ERROR(包名写错)
-        #     · 符号存在但没被选中     = 依赖不满足被牵连 → WARNING
-        # 用 awk 做整行/前缀比较, 避免包名里的 . + 被 grep -E 当正则解释。
-        #---------------------------------------------------------------
         REQ=$GITHUB_WORKSPACE/requested.config
         if [ ! -f "$REQ" ]; then
           echo "::warning::找不到 requested.config, 跳过配置符号存活检查"
@@ -231,7 +222,6 @@ jobs:
               continue
             fi
             dropped=$((dropped+1))
-            # 原因分类: 元数据里查不到 = 没有任何 feed 提供; 查得到但没选中 = 依赖不满足
             reason="依赖不满足, 被牵连关闭"
             if [ -f tmp/.config-package.in ] || [ -f tmp/.packageinfo ]; then
               if { [ -f tmp/.config-package.in ] \
@@ -244,8 +234,6 @@ jobs:
             else
               reason="缺少包元数据(tmp/.config-package.in 与 tmp/.packageinfo 都不存在), 无法判定"
             fi
-            # 只有 REQUIRED_PKGS 里点名的才硬失败, 其余只告警:
-            # 历史遗留的无效项不该挡住一次一小时的编译, 但必须留下可见的注解。
             case " ${REQUIRED_PKGS} " in
               *" ${sym} "*)
                 echo "::error::必需包 CONFIG_PACKAGE_${sym} 没进入 .config —— ${reason}"
@@ -260,12 +248,31 @@ jobs:
             exit 1
           fi
         fi
+        if [ -f /tmp/defconfig.log ]; then
+          echo "----- 已选中包的依赖落空检查 -----"
+          deperr=0
+          while IFS='|' read -r mkfile dep; do
+            [ -n "$mkfile" ] || continue
+            pkg=$(basename "$(dirname "$mkfile")")
+            if grep -qx "CONFIG_PACKAGE_${pkg}=y" .config; then
+              echo "::error::${pkg} 已选中, 但依赖 ${dep} 不存在 —— 镜像组装(package/install)必然失败"
+              deperr=$((deperr+1))
+            else
+              echo "  (忽略) ${pkg} 依赖 ${dep} 不存在, 但该包未被选中"
+            fi
+          done < <(awk -F"'" '/^WARNING: Makefile .* has a dependency on .*, which does not exist$/ {print $2 "|" $4}' /tmp/defconfig.log | sort -u)
+          echo "依赖落空的已选中包: ${deperr} 个"
+          if [ "$deperr" -gt 0 ]; then
+            echo "::error::有 ${deperr} 个已选中包的依赖不存在, 现在停下比跑到 package/install 再报错划算"
+            exit 1
+          fi
+        else
+          echo "::warning::没有 /tmp/defconfig.log, 跳过依赖落空检查"
+        fi
         echo "OK: 固件不含 node, 不含 unblockneteasemusic"
 
     - name: Compute ccache key
       run: |
-        # requested.config 由 Load custom configuration 复制而来; 万一缺失也不能让本步失败,
-        # 退化为只对 workflow 文件求指纹(最坏情况只是缓存键不随配置变化)。
         FILES=".github/workflows/x86_lean_GXT.yml"
         [ -f "$GITHUB_WORKSPACE/requested.config" ] && FILES="$GITHUB_WORKSPACE/requested.config $FILES"
         FINGERPRINT=$(sha256sum $FILES | sha256sum | cut -c1-12)
@@ -278,10 +285,8 @@ jobs:
         echo "缓存代次  : ${CCACHE_GEN}"
         echo "ccache 键 : ${PREFIX}-${FINGERPRINT}-${CCACHE_GEN}"
 
-    # 用 restore/save 两步而不是单个 actions/cache:
-    # 单步的保存动作是 post-if: success(), 编译失败就不落盘 —— 而"失败后重跑"正是
-    # 最需要缓存救命的场景(上次跑到第 50 分钟失败, 重跑不必再编一遍工具链和内核)。
     - name: Restore ccache
+      id: ccache-restore
       uses: actions/cache/restore@v6
       with:
         path: ${{ env.CCACHE_DIR_WORKSPACE }}
@@ -291,33 +296,96 @@ jobs:
           ccache-x64-gxt-
           ccache-x64-
 
+    # erofs 上游裸名 404/空 body; 改用 GitHub archive, hash 与 PKG_HASH 一致
+    - name: Pre-seed dl
+      run: |
+        cd openwrt
+        mkdir -p dl
+        seed() {
+          name="$1"; f="dl/$1"; want="$2"; shift 2
+          if [ -s "$f" ] && [ "$(sha256sum "$f" | cut -d' ' -f1)" = "$want" ]; then
+            echo "OK    $f 已存在, 校验通过"
+            return 0
+          fi
+          rm -f "$f"
+          for u in "$@"; do
+            echo "尝试 $u"
+            if curl -fsSL --retry 3 --retry-delay 3 --connect-timeout 20 --max-time 300 -o "$f.part" "$u"; then
+              got=$(sha256sum "$f.part" | cut -d' ' -f1)
+              if [ "$got" = "$want" ]; then
+                mv "$f.part" "$f"
+                echo "OK    $f ($(stat -c%s "$f") 字节)"
+                return 0
+              fi
+              echo "::warning::校验不符: 期望 $want, 实际 $got"
+            fi
+            rm -f "$f.part"
+          done
+          echo "::error::无法获取 $name (期望 sha256 $want)"
+          return 1
+        }
+
+        seed erofs-utils-1.8.10.tar.gz \
+          05eb4edebe11decce6ecb34e98d2f80c8cd283c2f2967d8ba7efd58418570514 \
+          https://github.com/erofs/erofs-utils/archive/refs/tags/v1.8.10.tar.gz \
+          https://codeload.github.com/erofs/erofs-utils/tar.gz/refs/tags/v1.8.10
+
+    # toplevel.mk 用分号串 4 个子目录, 退出码只看最后一个, 必须逐目录复核
     - name: Download package
-      id: package
       run: |
         cd openwrt
         make defconfig
-        make download -j8 || make download -j1 V=s
-        # 清掉下载失败留下的空壳文件(小于 1KB), 否则后续编译会报校验失败
+
+        make download -j8 || true
+
+        dl_fail=0
+        for d in tools toolchain package target; do
+          echo "----- 复核 $d/download -----"
+          if make "$d/download" -j4 > "/tmp/dl_$d.log" 2>&1; then
+            echo "OK    $d/download"
+            continue
+          fi
+          echo "::warning::$d/download 并行失败, 降级 -j1 V=s 重试"
+          if make "$d/download" -j1 V=s > "/tmp/dl_$d.log" 2>&1; then
+            echo "OK    $d/download (串行重试通过)"
+            continue
+          fi
+          echo "::error::$d 阶段仍有源码下载失败, 关键行:"
+          grep -E "Download failed|No more mirrors|curl: \(|ERROR:|Error [0-9]+" "/tmp/dl_$d.log" | tail -20 || true
+          dl_fail=1
+        done
+
         find dl -size -1024c -type f -print -delete || true
 
+        if [ "$dl_fail" -ne 0 ]; then
+          echo "::error::源码下载不完整, 已在编译前中止(不再白编 20 分钟)"
+          exit 1
+        fi
+        echo "OK    全部源码下载完成"
+
+    # 必须 pipefail, 否则 make 经 tee 后判的是 tee 的退出码
     - name: Compile the firmware
       id: compile
       run: |
         cd openwrt
-        # runner 实际用 `/usr/bin/bash -e {0}`, 默认**没有** pipefail;
-        # 不显式开启的话 `make | tee` 的退出码是 tee 的 0, 编译失败会被当成成功。
         set -o pipefail
         echo "使用 $(nproc) 线程编译"
-        # ccache 走命令行变量(原因见文件头 env 段的注释)。
-        # 变量必须跟着每一次 make 传, 因为 runner 的各个 run 步骤之间不共享 shell 变量。
         CCACHE_OPTS="CONFIG_CCACHE=y CONFIG_CCACHE_DIR=$CCACHE_DIR_WORKSPACE"
         mkdir -p "$CCACHE_DIR_WORKSPACE"
         export LC_ALL=C
         echo "ccache 目录: $CCACHE_DIR_WORKSPACE (上限 $CCACHE_MAXSIZE)"
-        ccache_val() { command -v ccache >/dev/null 2>&1 || return 0
-          ccache -s 2>/dev/null | grep -m1 "^$1" | sed -E 's/[^0-9]*([0-9]+).*/\1/'; }
-        echo "编译前: ccache 可缓存调用 $(ccache_val 'Cacheable calls') 次, 命中 $(ccache_val 'Hits') 次"
-        # tee 出一份完整日志, 失败时用于定位
+        ccache_report() {
+          local bin="$1"
+          if [ ! -x "$bin" ] && ! command -v "$bin" >/dev/null 2>&1; then
+            echo "   (找不到 ${bin}, 跳过统计)"; return 0
+          fi
+          CCACHE_DIR="$CCACHE_DIR_WORKSPACE" "$bin" -s 2>/dev/null | awk '
+            /Cacheable calls/ {v=$0; sub(/^[^:]*:[[:space:]]*/,"",v); split(v,a,"/"); gsub(/[^0-9]/,"",a[1]); calls=a[1]+0}
+            /Hits:/           {v=$0; sub(/^[^:]*:[[:space:]]*/,"",v); split(v,b,"/"); gsub(/[^0-9]/,"",b[1]); hits=b[1]+0}
+            END{ if (calls > 0) printf "   可缓存调用 %d 次, 命中 %d 次 (命中率 %.1f%%)\n", calls, hits, hits*100/calls;
+                 else printf "   尚无统计(缓存为空, 或 ccache 未真正参与编译)\n" }'
+        }
+        echo "编译前 ccache:"; ccache_report ccache
         if ! make -j"$(nproc)" $CCACHE_OPTS 2>&1 | tee build.log; then
           echo "::warning::并行编译失败, 用 -j1 V=s 重试一次以获取确定的错误位置"
           if ! make -j1 V=s $CCACHE_OPTS 2>&1 | tee -a build.log; then
@@ -326,17 +394,14 @@ jobs:
           fi
         fi
         echo "status=success" >> $GITHUB_OUTPUT
-        # 用 OpenWrt 自编的 ccache(4.10.2, 在 staging_dir/host/bin)读统计, 与编译时用的是同一个二进制
-        CCACHE_BIN=staging_dir/host/bin/ccache
-        if [ -x "$CCACHE_BIN" ]; then
-          echo "----- ccache 统计 -----"
-          "$CCACHE_BIN" -s 2>/dev/null | sed -n '1,16p' || true
+        echo "----- ccache 统计(编译后) -----"
+        if [ -x staging_dir/host/bin/ccache ]; then
+          ccache_report staging_dir/host/bin/ccache
         else
           echo "::warning::staging_dir/host/bin/ccache 不存在, ccache 可能没有真正启用"
         fi
         echo "----- 产物清单 -----"
         ls -lh bin/targets/*/*/ 2>/dev/null || true
-        # x86 Generic 没有 DEVICE_* 项, 该 grep 无匹配是正常的, 不能让步骤失败
         grep '^CONFIG_TARGET.*DEVICE.*=y' .config 2>/dev/null \
           | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME || true
         if [ -s DEVICE_NAME ]; then
@@ -344,6 +409,7 @@ jobs:
         fi
         echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
 
+    # manifest 是唯一过硬证据; 库名带 ABI 后缀(libstdcpp6)
     - name: Verify firmware contains required packages
       run: |
         cd openwrt
@@ -355,13 +421,9 @@ jobs:
         fi
         echo "核对 manifest: ${MANIFESTS[*]}"
         miss=0
-        # 逐个 manifest × 逐个必需包核对: 每个镜像都必须各自包含, 不能"任一文件有就算有"
         for m in "${MANIFESTS[@]}"; do
           echo "--- ${m}"
           for p in ${REQUIRED_PKGS}; do
-            # manifest 行格式为 "包名 - 版本"; awk 做整字段匹配避免前缀误判。
-            # 注意 kconfig 符号名 != manifest 包名: 带 ABI 版本后缀的库会变成
-            # libstdcpp->libstdcpp6 / libuv->libuv1, 所以要额外接受 "<名><数字>" 这种形式。
             hit=$(awk -v n="$p" '
               $2!="-"{next}
               $1==n {print $1" "$3; exit}
@@ -385,8 +447,6 @@ jobs:
       if: (!cancelled())
       run: df -hT
 
-    # 为 Save ccache 把关: 目录不存在时先建出来(否则 save 动作会报"path 不存在"),
-    # 同时量一下大小 —— 只有真正编过东西(>50MB)才值得占一个缓存配额。
     - name: Inspect ccache
       id: ccache-size
       if: (!cancelled())
@@ -394,26 +454,22 @@ jobs:
         mkdir -p "$CCACHE_DIR_WORKSPACE"
         SIZE=$(du -sm "$CCACHE_DIR_WORKSPACE" | cut -f1)
         echo "ccache 目录大小: ${SIZE} MB"
-        # 只在真正编过东西(>50MB)时才值得占一个缓存配额; 用显式布尔输出,
-        # 不在 if 里做字符串/数字隐式比较。
-        if [ "${SIZE:-0}" -ge 50 ]; then WORTH=true; else WORTH=false; fi
+        if [ "${SIZE:-0}" -ge 300 ]; then WORTH=true; else WORTH=false; fi
         echo "worth=${WORTH}" >> $GITHUB_OUTPUT
-        echo "是否保存缓存: ${WORTH} (阈值 50MB)"
+        echo "是否保存缓存: ${WORTH} (阈值 300MB)"
         CCACHE_BIN=openwrt/staging_dir/host/bin/ccache
         if [ -x "$CCACHE_BIN" ]; then
           echo "----- ccache 最终统计 -----"
-          "$CCACHE_BIN" -s 2>/dev/null | sed -n '1,16p' || true
+          CCACHE_DIR="$CCACHE_DIR_WORKSPACE" "$CCACHE_BIN" -s 2>/dev/null | sed -n '1,14p' || true
         fi
 
-    # if: always() 是关键: 编译失败时也要把已生成的缓存存下来, 否则下次重跑仍从零开始。
     - name: Save ccache
-      if: always() && !cancelled() && steps.ccache-size.outputs.worth == 'true'
+      if: always() && !cancelled() && steps.ccache-size.outputs.worth == 'true' && steps.ccache-restore.outputs.cache-hit != 'true'
       uses: actions/cache/save@v6
       with:
         path: ${{ env.CCACHE_DIR_WORKSPACE }}
         key: ${{ env.CCACHE_KEY }}
 
-    # 失败时把关键信息直接打到日志里, 不必下载 artifact 就能判断原因
     - name: Report build failure
       if: failure()
       run: |
@@ -445,7 +501,6 @@ jobs:
       id: organize
       if: steps.compile.outputs.status == 'success' && env.UPLOAD_FIRMWARE == 'true'
       run: |
-        # 不用 cd 通配符: 目录不存在时给出可读的报错, 而不是 No such file or directory
         TARGET_DIR=$(echo openwrt/bin/targets/*/* | cut -d' ' -f1)
         if [ ! -d "$TARGET_DIR" ]; then
           echo "::error::未找到固件输出目录, 编译未产出镜像"
@@ -465,11 +520,17 @@ jobs:
         name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
         path: ${{ env.FIRMWARE }}
 
+    # 空 tag 会生成 untagged-<hash> 草稿, 先校验格式
     - name: Generate release tag
       id: tag
       if: steps.organize.outputs.status == 'success' && env.UPLOAD_RELEASE == 'true'
       run: |
-        echo "release_tag=GXT-$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
+        TAG="GXT-$(date +"%Y.%m.%d-%H%M")"
+        case "$TAG" in
+          GXT-[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9]-[0-9][0-9][0-9][0-9]) ;;
+          *) echo "::error::生成的 tag 格式不合法: '$TAG'"; exit 1 ;;
+        esac
+        echo "release_tag=${TAG}" >> $GITHUB_OUTPUT
         {
           echo "【GXT】固件不含 luci-app-unblockneteasemusic 与 node。"
           echo ""
@@ -481,12 +542,15 @@ jobs:
 
     - name: Upload firmware to release
       uses: softprops/action-gh-release@v3
-      if: steps.tag.outputs.status == 'success'
+      if: steps.tag.outputs.status == 'success' && steps.tag.outputs.release_tag != ''
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         tag_name: ${{ steps.tag.outputs.release_tag }}
         body_path: release.txt
+        draft: false
+        prerelease: false
+        fail_on_unmatched_files: true
         files: ${{ env.FIRMWARE }}/*
 
     - name: Delete old workflow runs
@@ -504,9 +568,16 @@ jobs:
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
+        gh release list --limit 200 --json tagName,isDraft \
+          --jq '.[] | select(.isDraft) | .tagName' \
+          | grep '^untagged-' \
+          | while read -r tag; do
+              echo "删除草稿 release: $tag"
+              gh release delete "$tag" --yes 2>/dev/null || true
+            done
+
         gh release list --limit 100 --json tagName --jq '.[].tagName' \
           | grep '^GXT-' | sort -r | tail -n +4 \
           | while read -r tag; do
               [ -n "$tag" ] && gh release delete "$tag" --yes --cleanup-tag
             done
-

@@ -1,15 +1,6 @@
-#=================================================
-# 基于 https://github.com/xayane/Actions-Lean-OpenWrt 调整
-# 用途: 单独编译 luci-app-unblockneteasemusic(JS 版) 及其运行时依赖 node, 产出 ipk
-#
-# 插件来源: LEDE luci feed 自带版本(v3.4, nftset + firewall4)。
-#   MJ 与 GXT 两台已统一到该版本, 因此只需跑一次:
-#     - 插件本体 LUCI_PKGARCH:=all, 与架构无关;
-#     - node 的 ipk 两台同架构(x86_64)通用。
-#
-# lede_commit 必须与对应固件构建使用的 commit 一致, 否则 node 链接的
-# libc/libstdc++/openssl 版本可能与固件不匹配, opkg 会报符号缺失。
-#=================================================
+# 插件 ipk · luci-app-unblockneteasemusic v3.4 + node 运行时(两台共用)
+# lede_commit 必须等于固件构建时的 HEAD, 否则 node 的 ABI 对不上
+# 变更记录见 CHANGELOG.md
 
 name: Build UNM ipk (standalone)
 
@@ -40,8 +31,7 @@ concurrency:
 
 jobs:
   build:
-
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-24.04
 
     steps:
     - name: Checkout
@@ -61,10 +51,6 @@ jobs:
         echo "gcc         : $(gcc --version | head -1)"
         echo "########## apt 源 ##########"
         ls -1 /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null || true
-        # 24.04 起默认源是 deb822 格式(ubuntu.sources 里的 Types: deb),
-        # 老格式是 sources.list / *.list 里的 deb 行, 两种都要认。
-        # 注意只把"确实存在的文件"交给 grep: grep 遇到不存在的文件会返回 2,
-        # 在 `if ! grep` 里会被误判成"没有源"。
         srcs=""
         if [ -f /etc/apt/sources.list ]; then srcs="$srcs /etc/apt/sources.list"; fi
         for f in /etc/apt/sources.list.d/*; do
@@ -80,17 +66,23 @@ jobs:
         fi
         echo "OK: apt 源存在 ($(echo $srcs | wc -w) 个文件)"
 
-    - name: Free Disk Space (Ubuntu)
-      uses: jlumbroso/free-disk-space@main
-      with:
-        preinstalled-runtimes: true
-        docker-images: true
-        android: true
-        dotnet: true
-        haskell: true
-        large-packages: true
-        swap-storage: true
+    - name: Free disk space
+      run: |
+        set -x
+        sudo swapoff -a || true
+        sudo rm -f /swapfile || true
+        echo "=========== before ==========="; df -hT /
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                    /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                    /usr/share/swift /usr/lib/jvm /opt/az /usr/local/.ghcup || true
+        sudo rm -rf /usr/local/lib/node_modules || true
+        sudo docker image prune --all --force || true
+        sudo docker system prune --all --force || true
+        sudo apt-get clean || true
+        sudo rm -rf /var/lib/apt/lists/* || true
+        echo "=========== after ==========="; df -hT /
 
+    # 依赖名跨镜像不同(ncurses5 / ncurses), 先 pick() 探测再装
     - name: Install build dependencies
       env:
         DEBIAN_FRONTEND: noninteractive
@@ -127,7 +119,6 @@ jobs:
               subversion swig squashfs-tools scons device-tree-compiler qemu-utils
               upx-ucl libglib2.0-dev libfuse-dev ccache"
 
-        # 只在完整固件编译或个别插件里用到, 缺了不影响 node/UNM, 降级为告警。
         OPT="ack antlr3 asciidoc autopoint clang llvm genisoimage gperf haveged help2man
              intltool libc6-dev-i386 lrzsz msmtp p7zip p7zip-full uglifyjs vim xmlto xxd"
 
@@ -152,7 +143,6 @@ jobs:
           if has_pkg "$p"; then opt_list="$opt_list $p"; else opt_missing="$opt_missing $p"; fi
         done
 
-        # 先整批装; 失败再逐个重试, 把真正装不上的挑出来, 不让单个包拖垮整步
         if [ -n "$opt_list" ]; then
           if ! sudo -E apt-get -y install $opt_list >/dev/null 2>&1; then
             echo "::warning::可选依赖整批安装失败, 改为逐个安装定位"
@@ -189,7 +179,6 @@ jobs:
         git clone --depth 1 --branch "$REPO_BRANCH" --single-branch "$REPO_URL" openwrt
         cd openwrt
 
-        # 去掉手抖带进来的空格/换行
         RAW="$(printf '%s' "$RAW_COMMIT" | tr -d '[:space:]')"
 
         if [ -z "$RAW" ]; then
@@ -197,8 +186,6 @@ jobs:
           echo "::warning::若它与固件构建时的 commit 不同, node 链的 libstdc++/libssl 可能对不上, 路由器上会报符号缺失"
           echo "LEDE_PINNED=no" >> $GITHUB_ENV
         else
-          # 只接受 7-40 位十六进制。路由器 /etc/openwrt_release 里
-          # DISTRIB_REVISION='r28000-abc1234' 末尾那串短哈希也可以直接填。
           case "$RAW" in
             *[!0-9a-fA-F]*) echo "::error::lede_commit 含非十六进制字符: $RAW"; exit 1 ;;
           esac
@@ -208,8 +195,6 @@ jobs:
           if [ "${#RAW}" -eq 40 ]; then
             FULL="$RAW"
           else
-            # 注意: GitHub API 不支持用短哈希查 commit(会直接返回 "No commit found for SHA"),
-            # 所以在分支历史里按前缀匹配。固件是新近构建的, 最近 500 个 commit 足够覆盖。
             page=1
             while [ "$page" -le 5 ] && [ -z "$FULL" ]; do
               list="$(gh api "repos/coolsnowwolf/lede/commits?sha=${REPO_BRANCH}&per_page=100&page=${page}" --jq '.[].sha' 2>/dev/null || true)"
@@ -228,7 +213,6 @@ jobs:
             echo "短哈希 ${RAW} -> 完整 ${FULL}"
           fi
 
-          # 优先只取这一个 commit; 服务器不允许按 sha 取时逐级加深
           git fetch --depth 1 origin "$FULL" 2>/dev/null \
             || git fetch --depth 500 origin "$REPO_BRANCH" 2>/dev/null \
             || git fetch origin
@@ -266,9 +250,6 @@ jobs:
           openwrt/build_dir/toolchain-*
         key: unm-host-${{ env.LEDE_COMMIT }}-${{ hashFiles('unm/unm.config') }}
 
-    # ccache 键: 精确 key 带 run_id(缓存条目不可覆盖, 固定 key 会让第二次之后不再写入新内容),
-    # restore-keys 逐级放宽到同分支任意 commit —— ccache 条目内容寻址, 跨 commit 复用安全。
-    # 指纹用 unm/unm.config(本 workflow 的意图配置)与自身 workflow 文件。
     - name: Compute ccache key
       run: |
         FINGERPRINT=$(sha256sum "$CONFIG_FILE" .github/workflows/build_unm_pkg.yml \
@@ -304,7 +285,6 @@ jobs:
             printf '%-40s %s\n' "$d" "空"
           fi
         done
-        # 标准 runner 只有 14 GB 磁盘, 缓存 + 编译产物很容易吃满。
         avail=$(df -Pk / | awk 'NR==2{print int($4/1024)}')
         echo "根分区可用         : ${avail} MB"
         if [ "${avail:-0}" -lt 6000 ]; then
@@ -325,8 +305,6 @@ jobs:
           echo "::error::luci feed 中找不到 ${UNM_PKG}, 请检查 feeds.conf.default 的 luci 分支"
           exit 1
         }
-        # feed 版 Makefile 用相对路径 include ../../luci.mk,
-        # 因此必须是 feeds 的符号链接形态; 若被替换成真实目录会报找不到 luci.mk
         if [ -L "$PKG_DIR" ]; then
           echo "OK: ${PKG_DIR} 是符号链接(相对 include 可用)"
         else
@@ -337,7 +315,6 @@ jobs:
           "$PKG_DIR/Makefile" | tee /tmp/unm-meta.txt
         grep -q 'JavaScript' "$PKG_DIR/Makefile" \
           || echo "::warning::标题不含 JavaScript, 可能不是预期的 JS 版插件"
-        # 确认分流实现是 fw4 的 nftset 模板(而非旧的 ipset)
         if grep -q 'nftables.ut' "$PKG_DIR/root/etc/init.d/${UNM_PKG#luci-app-}"; then
           echo "分流实现: nftset (fw4)"
         else
@@ -347,17 +324,17 @@ jobs:
         [ -n "$UNM_VER" ] || UNM_VER="unknown"
         echo "UNM_VER=${UNM_VER}" >> $GITHUB_ENV
 
+    # 仓库里的 unm.config 是 CRLF, 复制后归一化行尾
     - name: Apply config
       run: |
         cd openwrt
         cp "$GITHUB_WORKSPACE/$CONFIG_FILE" .config
-        # 仓库里的 unm.config 在 Windows 上编辑过会是 CRLF; kconfig 自己能剥掉 \r,
-        # 但这里顺手归一化, 免得后续比较/排查时被行尾差异干扰
         sed -i 's/\r$//' .config
         echo "----- 喂给 defconfig 的关键行 -----"
         grep -E '^CONFIG_(TARGET|PACKAGE_node|PACKAGE_luci-app-unblockneteasemusic)' .config || true
         make defconfig
 
+    # profile 符号名随 LEDE 变化, 只硬断言 board + subtarget
     - name: Verify configuration
       run: |
         cd openwrt
@@ -370,19 +347,11 @@ jobs:
         grep -E '^CONFIG_NODEJS' .config || true
 
         fail=0
-        # node 的 ABI 只由 board + subtarget 决定(它们决定 ARCH、工具链、libc/libstdc++/libssl),
-        # profile 只影响镜像打包与 DEFAULT_PACKAGES, 单包编译不需要它。
-        # 所以硬断言只落在 board/subtarget 上。
         grep -qE '^CONFIG_TARGET_x86=y' .config \
           || { echo "::error::board 未选中: CONFIG_TARGET_x86 缺失"; fail=1; }
         grep -qE '^CONFIG_TARGET_x86_64=y' .config \
           || { echo "::error::subtarget 未选中: CONFIG_TARGET_x86_64 缺失"; fail=1; }
 
-        # profile 的符号名随源码版本变过:
-        #   旧版 target/linux/x86/64/target.mk 有 `define Profile/Generic` -> CONFIG_TARGET_x86_64_Generic
-        #   新版只剩 image/64.mk 的 `define Device/generic` + TARGET_DEVICES -> CONFIG_TARGET_x86_64_DEVICE_generic
-        # 当前 LEDE master 的 target.mk 里已经没有 Profile/Generic, 所以只断言 Generic 必然失败。
-        # 这里按"三选一命中即可, 但一个 profile 都没有就真错了"来判。
         if grep -qE '^CONFIG_TARGET_x86_64_(Generic|DEVICE_generic)=y' .config; then
           echo "OK: x86_64 的 Generic profile 已选中"
         elif grep -qE '^CONFIG_TARGET_x86_64_[A-Za-z0-9_]+=y' .config; then
@@ -400,12 +369,11 @@ jobs:
         [ $fail -eq 0 ] || exit 1
         echo "OK: 配置校验通过(board/subtarget 与关键包均已就位)"
 
+    # Source-Makefile 自带 package/ 前缀只拼一次; 不用 make -p(顶层看不到包子目标)
     - name: Resolve package build targets
       run: |
         cd openwrt
 
-        # 注意: tmp/.packageinfo 里 Source-Makefile 排在 Package: 之前, 必须先缓存再匹配
-        # 返回的是 repo 根相对路径, 形如 package/feeds/packages/node
         resolve_src() {
           awk -v want="$1" '
             /^Source-Makefile: / { p = $2; sub(/\/Makefile$/, "", p) }
@@ -413,7 +381,6 @@ jobs:
           ' tmp/.packageinfo
         }
 
-        # 剥掉开头的 package/, 得到相对 package/ 的目录名(与 .packagedeps 里的写法一致)
         strip_prefix() {
           case "$1" in
             package/*) printf '%s\n' "${1#package/}" ;;
@@ -421,11 +388,7 @@ jobs:
           esac
         }
 
-        # 已注册的 builddir 集合: package-y/package- 右侧, 以及 $(curdir)/xxx/compile 左侧
         if [ -f tmp/.packagedeps ]; then
-          # 两种写法都要归一化成"无前导斜杠的相对目录"
-          #   package-y += feeds/packages/node
-          #   $(curdir)/feeds/packages/node/compile += ...
           sed -n -e 's/^package-[ym]* += //p' -e 's/^\$(curdir)\(.*\)\/compile += .*/\1/p' \
             -e 's/^\$(curdir)\(.*\)\/compile:.*/\1/p' tmp/.packagedeps \
             | tr ' ' '\n' | sed -e 's|^/||' -e '/^$/d' | sort -u > /tmp/registered-dirs.txt
@@ -453,8 +416,6 @@ jobs:
         done
         [ $fail -eq 0 ] || exit 1
 
-        # 拼目标并在 .packagedeps 里核对是否真的注册了
-        # 注意: 本函数用 $( ) 捕获返回值, 所有诊断信息必须走 stderr, 否则会污染目标名
         make_goal() {
           local name="$1" rel goal
           rel="$(strip_prefix "$(resolve_src "$name")")"
@@ -470,7 +431,6 @@ jobs:
 
         NODE_GOAL="$(make_goal node)"
         UNM_GOAL="$(make_goal "$UNM_PKG")"
-        # 双 package/ 前缀是最容易犯的错, 出现就立即失败, 不要等到 40 分钟后再报
         case "$NODE_GOAL$UNM_GOAL" in
           *package/package/*)
             echo "::error::目标名出现重复的 package/ 前缀: $NODE_GOAL / $UNM_GOAL"
@@ -482,9 +442,6 @@ jobs:
         echo "node -> $NODE_GOAL"
         echo "unm  -> $UNM_GOAL"
 
-        # 备用目标: include/subdir.mk 的 diralias 会为每个 builddir 额外注册
-        # package/<目录名>/compile(如 package/node/compile)。第六次运行的日志已证明这种写法可用,
-        # 只是在同名目录冲突时会指向不确定的那个, 所以只作为主目标失败后的兜底。
         NODE_REL="$(strip_prefix "$(resolve_src node)")"
         UNM_REL="$(strip_prefix "$(resolve_src "$UNM_PKG")")"
         echo "NODE_GOAL_ALT=package/$(basename "$NODE_REL")/compile" >> $GITHUB_ENV
@@ -492,8 +449,6 @@ jobs:
         echo "node 备用 -> package/$(basename "$NODE_REL")/compile"
         echo "unm  备用 -> package/$(basename "$UNM_REL")/compile"
 
-        # 诊断: 把 node 的编译依赖列表打出来, 并标出有没有 kernel/linux。
-        # tmp/.packagedeps 是 makefile 片段, 路径写成字面量 $(curdir)/<相对目录>/compile
         if [ -f tmp/.packagedeps ]; then
           DEPS="$(grep -F "\$(curdir)/${NODE_REL}/compile" tmp/.packagedeps | head -1 || true)"
           DEPS="${DEPS#*= }"   # 去掉 "目标 +=" 前缀, 只留右侧依赖
@@ -507,16 +462,50 @@ jobs:
           fi
         fi
 
+    # erofs 上游裸名 404/空 body; 改用 GitHub archive, hash 与 PKG_HASH 一致
+    - name: Pre-seed dl
+      run: |
+        cd openwrt
+        mkdir -p dl
+        seed() {
+          name="$1"; f="dl/$1"; want="$2"; shift 2
+          if [ -s "$f" ] && [ "$(sha256sum "$f" | cut -d' ' -f1)" = "$want" ]; then
+            echo "OK    $f 已存在, 校验通过"
+            return 0
+          fi
+          rm -f "$f"
+          for u in "$@"; do
+            echo "尝试 $u"
+            if curl -fsSL --retry 3 --retry-delay 3 --connect-timeout 20 --max-time 300 -o "$f.part" "$u"; then
+              got=$(sha256sum "$f.part" | cut -d' ' -f1)
+              if [ "$got" = "$want" ]; then
+                mv "$f.part" "$f"
+                echo "OK    $f ($(stat -c%s "$f") 字节)"
+                return 0
+              fi
+              echo "::warning::校验不符: 期望 $want, 实际 $got"
+            fi
+            rm -f "$f.part"
+          done
+          echo "::error::无法获取 $name (期望 sha256 $want)"
+          return 1
+        }
+
+        seed erofs-utils-1.8.10.tar.gz \
+          05eb4edebe11decce6ecb34e98d2f80c8cd283c2f2967d8ba7efd58418570514 \
+          https://github.com/erofs/erofs-utils/archive/refs/tags/v1.8.10.tar.gz \
+          https://codeload.github.com/erofs/erofs-utils/tar.gz/refs/tags/v1.8.10
+
     - name: Build tools and toolchain
       run: |
         cd openwrt
-        # ccache: 命令行变量, 见 env 段注释。第一次会先编 tools/ccache(4.10.2) 再编其余工具。
         CCACHE_OPTS="CONFIG_CCACHE=y CONFIG_CCACHE_DIR=$CCACHE_DIR_WORKSPACE"
         mkdir -p "$CCACHE_DIR_WORKSPACE"
         echo "ccache 目录: $CCACHE_DIR_WORKSPACE (上限 $CCACHE_MAXSIZE)"
         make tools/install -j$(nproc) $CCACHE_OPTS || make tools/install -j1 $CCACHE_OPTS
         make toolchain/install -j$(nproc) $CCACHE_OPTS || make toolchain/install -j1 $CCACHE_OPTS
 
+    # 根 Makefile 设计上包在 target 之后, 不先编内核 kmod 打包必失败
     - name: Build kernel for target
       run: |
         cd openwrt
@@ -534,7 +523,6 @@ jobs:
           }
         echo "内核编译耗时: $(( $(date +%s) - START )) 秒"
 
-        # 自证: 内核配置与 modules.builtin 必须存在, 否则 kmod 打包一定失败
         KBUILD_DIR=$(ls -d build_dir/target-*/linux-*/linux-[0-9]* 2>/dev/null | head -1)
         echo "内核源码目录: ${KBUILD_DIR:-<未找到>}"
         if [ -z "$KBUILD_DIR" ] || [ ! -f "$KBUILD_DIR/.config" ]; then
@@ -543,12 +531,10 @@ jobs:
         fi
         echo "OK: 内核已就绪, .ko 数量 = $(find "$KBUILD_DIR" -name '*.ko' | wc -l)"
 
+    # 必须 pipefail, 否则 make 经 tee 后判的是 tee 的退出码
     - name: Compile node runtime
       run: |
         cd openwrt
-        # runner 实际用的是 `/usr/bin/bash -e {0}`(日志可查), 默认**没有** pipefail,
-        # 于是 `make | tee` 的 $? 是 tee 的 0, make 失败会被吞掉 —— 第七次运行就是这样:
-        # 本步报 Error 2 却仍继续执行, 一直到 Collect ipk 才以 "bin/packages 不存在" 失败。
         set -o pipefail
         LOG=/tmp/node-build.log
         GOAL="$NODE_GOAL"
@@ -557,7 +543,6 @@ jobs:
         set +e
         make "$GOAL" V=s -j$(nproc) $CCACHE_OPTS 2>&1 | tee "$LOG"
         rc=$?
-        # 主目标若未被 make 识别, 自动退到 include/subdir.mk 的目录别名目标再试一次
         if [ $rc -ne 0 ] && grep -qF 'No rule to make target' "$LOG"; then
           echo "::warning::主目标 $GOAL 未被识别, 改用目录别名目标 ${NODE_GOAL_ALT}"
           GOAL="$NODE_GOAL_ALT"
@@ -611,7 +596,6 @@ jobs:
           exit 1
         fi
 
-    # ccache 的成败要看命中的绝对值, 所以把统计直接打到日志里, 不依赖本地复现。
     - name: Inspect ccache
       id: ccache-size
       if: always() && !cancelled()
@@ -619,11 +603,9 @@ jobs:
         mkdir -p "$CCACHE_DIR_WORKSPACE"
         SIZE=$(du -sm "$CCACHE_DIR_WORKSPACE" | cut -f1)
         echo "ccache 目录大小: ${SIZE} MB"
-        # 只在真正编过东西(>50MB)时才值得占一个缓存配额; 用显式布尔输出,
-        # 不在 if 里做字符串/数字隐式比较。
-        if [ "${SIZE:-0}" -ge 50 ]; then WORTH=true; else WORTH=false; fi
+        if [ "${SIZE:-0}" -ge 300 ]; then WORTH=true; else WORTH=false; fi
         echo "worth=${WORTH}" >> $GITHUB_OUTPUT
-        echo "是否保存缓存: ${WORTH} (阈值 50MB)"
+        echo "是否保存缓存: ${WORTH} (阈值 300MB)"
         CCACHE_BIN=openwrt/staging_dir/host/bin/ccache
         if [ -x "$CCACHE_BIN" ]; then
           echo "----- ccache 统计 -----"
@@ -632,10 +614,8 @@ jobs:
           echo "::warning::staging_dir/host/bin/ccache 不存在, ccache 可能没有真正启用"
         fi
 
-    # if: always() 是关键: 本 workflow 历史上多次在中途失败, 失败时也存缓存,
-    # 下次重跑才能跳过已编过的工具链/内核。
     - name: Save ccache
-      if: always() && !cancelled() && steps.ccache-size.outputs.worth == 'true'
+      if: always() && !cancelled() && steps.ccache-size.outputs.worth == 'true' && steps.ccache.outputs.cache-hit != 'true'
       uses: actions/cache/save@v6
       with:
         path: ${{ env.CCACHE_DIR_WORKSPACE }}
@@ -695,7 +675,7 @@ jobs:
             echo "> 若与固件构建时的 commit 不同, node 的运行时依赖可能对不上。"
             echo "> 请带 \`lede_commit\` 重跑一次, 值取固件 workflow 运行页 Summary 里的那串。"
           fi
-          echo "- runner 镜像: ubuntu-26.04(公共预览)"
+          echo "- runner 镜像: ${ImageOS:-unknown} (与固件 workflow 同一标签)"
           echo "- 缓存: \`dl\`=${{ steps.dl-cache.outputs.cache-hit }} / 宿主工具链=${{ steps.host-cache.outputs.cache-hit }}"
           echo ""
           echo "插件本体为 \`PKGARCH:=all\`,node 为 x86_64;两台路由器同一份 ipk 通用。"
@@ -706,4 +686,3 @@ jobs:
           echo ""
           echo "安装: 把 artifact 内全部 ipk 上传到路由器 /tmp/unm-ipk, 执行 tools/install-unm-on-router.sh"
         } >> $GITHUB_STEP_SUMMARY
-
