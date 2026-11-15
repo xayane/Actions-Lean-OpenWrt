@@ -66,21 +66,18 @@ jobs:
         fi
         echo "OK: apt 源存在 ($(echo $srcs | wc -w) 个文件)"
 
-    - name: Free disk space
-      run: |
-        set -x
-        sudo swapoff -a || true
-        sudo rm -f /swapfile || true
-        echo "=========== before ==========="; df -hT /
-        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                    /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
-                    /usr/share/swift /usr/lib/jvm /opt/az /usr/local/.ghcup || true
-        sudo rm -rf /usr/local/lib/node_modules || true
-        sudo docker image prune --all --force || true
-        sudo docker system prune --all --force || true
-        sudo apt-get clean || true
-        sudo rm -rf /var/lib/apt/lists/* || true
-        echo "=========== after ==========="; df -hT /
+    # 第三方清理(v2.0.0, 仓库已从 jlumbroso 转到 lumbroso-commons); @main 浮动引用已改为固定 tag
+    - name: Free Disk Space (Ubuntu)
+      uses: lumbroso-commons/free-disk-space@v2.0.0
+      with:
+        preinstalled-runtimes: true
+        docker-images: true
+        android: true
+        dotnet: true
+        haskell: true
+        large-packages: true
+        # v2.0.0 起默认 false; 保持与原配置一致, 若出现 exit 137/OOM 再改 false
+        swap-storage: true
 
     # 依赖名跨镜像不同(ncurses5 / ncurses), 先 pick() 探测再装
     - name: Install build dependencies
