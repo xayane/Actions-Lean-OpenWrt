@@ -37,10 +37,6 @@ env:
 permissions:
   contents: write
 
-concurrency:
-  group: mj-firmware-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
   check:
     name: Check for source code updates
