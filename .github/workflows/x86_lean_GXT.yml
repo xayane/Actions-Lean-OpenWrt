@@ -37,9 +37,6 @@ env:
 permissions:
   contents: write
 
-concurrency:
-  group: gxt-firmware-${{ github.ref }}
-  cancel-in-progress: false
 
 jobs:
   check:
