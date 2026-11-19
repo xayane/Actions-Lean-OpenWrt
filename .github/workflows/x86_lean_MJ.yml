@@ -288,45 +288,22 @@ jobs:
           ccache-x64-mj-
           ccache-x64-
 
-    # erofs 上游裸名 404/空 body; 改用 GitHub archive, hash 与 PKG_HASH 一致
-    - name: Pre-seed dl
-      run: |
-        cd openwrt
-        mkdir -p dl
-        seed() {
-          name="$1"; f="dl/$1"; want="$2"; shift 2
-          if [ -s "$f" ] && [ "$(sha256sum "$f" | cut -d' ' -f1)" = "$want" ]; then
-            echo "OK    $f 已存在, 校验通过"
-            return 0
-          fi
-          rm -f "$f"
-          for u in "$@"; do
-            echo "尝试 $u"
-            if curl -fsSL --retry 3 --retry-delay 3 --connect-timeout 20 --max-time 300 -o "$f.part" "$u"; then
-              got=$(sha256sum "$f.part" | cut -d' ' -f1)
-              if [ "$got" = "$want" ]; then
-                mv "$f.part" "$f"
-                echo "OK    $f ($(stat -c%s "$f") 字节)"
-                return 0
-              fi
-              echo "::warning::校验不符: 期望 $want, 实际 $got"
-            fi
-            rm -f "$f.part"
-          done
-          echo "::error::无法获取 $name (期望 sha256 $want)"
-          return 1
-        }
-
-        seed erofs-utils-1.8.10.tar.gz \
-          05eb4edebe11decce6ecb34e98d2f80c8cd283c2f2967d8ba7efd58418570514 \
-          https://github.com/erofs/erofs-utils/archive/refs/tags/v1.8.10.tar.gz \
-          https://codeload.github.com/erofs/erofs-utils/tar.gz/refs/tags/v1.8.10
-
-    # toplevel.mk 用分号串 4 个子目录, 退出码只看最后一个, 必须逐目录复核
     - name: Download package
       run: |
         cd openwrt
         make defconfig
+        # 通用下载兜底: 用 LEDE 官方 CONFIG_DOWNLOAD_TOOL_CUSTOM 注入包装器,
+        # 对所有源码包生效; 上游源修好后直连成功即自动失效, 不碰上游源码。
+        # 必须在 defconfig 之后写, 否则会被 defconfig 重新生成覆盖。
+        wrapper="$GITHUB_WORKSPACE/dl-fallback.sh"
+        if [ -x "$wrapper" ]; then
+          grep -q '^CONFIG_DOWNLOAD_TOOL_CUSTOM=' .config && \
+            sed -i 's|^CONFIG_DOWNLOAD_TOOL_CUSTOM=.*|CONFIG_DOWNLOAD_TOOL_CUSTOM="'"$wrapper"'"|' .config || \
+            echo 'CONFIG_DOWNLOAD_TOOL_CUSTOM="'"$wrapper"'"' >> .config
+          echo "OK    通用下载兜底已启用: $wrapper"
+        else
+          echo "::warning::找不到 $wrapper, 沿用 OpenWrt 默认下载"
+        fi
 
         make download -j8 || true
 
@@ -378,11 +355,28 @@ jobs:
                  else printf "   尚无统计(缓存为空, 或 ccache 未真正参与编译)\n" }'
         }
         echo "编译前 ccache:"; ccache_report ccache
+        # 上游 LEDE 的 json_overview_image_info.py 写死 make val.* 输出恰好 2 行;
+        # 新版 verbose.mk 把进度行打到 stdout 变成 3 行而崩溃。固件此时已产出,
+        # 且本 workflow 不使用 profiles.json, 故只在"固件存在 + 该错误特征"时放行,
+        # 不碰上游脚本, 也不掩盖任何真正的编译失败。
+        known_bug() {
+          grep -q 'json_overview_image_info.py' build.log 2>/dev/null &&
+          grep -q 'too many values to unpack' build.log 2>/dev/null &&
+          find bin/targets -name '*-combined-efi.img.gz' -o -name '*-combined.img.gz' 2>/dev/null | grep -q .
+        }
         if ! make -j"$(nproc)" $CCACHE_OPTS 2>&1 | tee build.log; then
-          echo "::warning::并行编译失败, 用 -j1 V=s 重试一次以获取确定的错误位置"
-          if ! make -j1 V=s $CCACHE_OPTS 2>&1 | tee -a build.log; then
-            echo "::error::编译失败, 详见 artifact 中的 build.log"
-            exit 1
+          if known_bug; then
+            echo "::warning::仅 profiles.json 生成崩溃(上游 verbose.mk 变更), 固件镜像已产出, 继续后处理"
+          else
+            echo "::warning::并行编译失败, 用 -j1 V=s 重试一次以获取确定的错误位置"
+            if ! make -j1 V=s $CCACHE_OPTS 2>&1 | tee -a build.log; then
+              if known_bug; then
+                echo "::warning::仅 profiles.json 生成崩溃(上游 verbose.mk 变更), 固件镜像已产出, 继续后处理"
+              else
+                echo "::error::编译失败, 详见 artifact 中的 build.log"
+                exit 1
+              fi
+            fi
           fi
         fi
         echo "status=success" >> $GITHUB_OUTPUT
